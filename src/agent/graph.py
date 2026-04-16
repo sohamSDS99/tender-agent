@@ -47,6 +47,7 @@ from src.agent.nodes.discover import discover_node as discover_node
 from src.agent.nodes.evaluate import evaluate_node as evaluate_node
 from src.agent.nodes.retrieve_draft import retrieve_draft_node as retrieve_draft_node
 from src.agent.nodes.gap_check import gap_check_node as gap_check_node
+from src.agent.nodes.slack_escalate import slack_escalate_node as slack_escalate_node
 
 logger = structlog.get_logger(__name__)
 
@@ -90,35 +91,6 @@ def _audit(node: str, action: str, detail: str) -> dict:
 
 
 
-
-def slack_escalate_node(state: TenderState) -> dict:
-    """Node 5: SLACK ESCALATE — Send questions to team, wait for response.
-
-    PLACEHOLDER: Simulates immediate Slack response. Real implementation
-    (Step 16) will:
-    - Format gap items into clear Slack messages
-    - Send to designated channel via Slack Bolt SDK
-    - Enter checkpointed wait state (graph pauses)
-    - Resume when human responds (via Slack event handler)
-    - Handle 48h timeout with escalation to manager
-    - Incorporate responses into state for re-drafting
-    """
-    logger.info("node_slack_escalate", tender_id=state.get("tender_id", "unknown"))
-
-    gaps = state.get("gaps", [])
-    questions = [g.get("suggested_question", "N/A") for g in gaps]
-    current_count = state.get("escalation_count", 0)
-
-    return {
-        "slack_questions": questions,
-        "slack_responses": ["[Mock response: information provided]"] * len(questions),
-        "escalation_count": current_count + 1,
-        "status": TenderStatus.AWAITING_HUMAN.value,
-        "current_node": "slack_escalate",
-        "audit_log": [_audit("slack_escalate", "questions_sent", (
-            f"Sent {len(questions)} questions to Slack. Escalation #{current_count + 1}."
-        ))],
-    }
 
 
 def assemble_node(state: TenderState) -> dict:

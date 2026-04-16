@@ -43,6 +43,7 @@ import structlog
 from langgraph.graph import END, START, StateGraph
 
 from src.agent.state import TenderState, TenderStatus
+from src.agent.nodes.evaluate import evaluate_node as evaluate_node
 
 logger = structlog.get_logger(__name__)
 
@@ -103,43 +104,6 @@ def discover_node(state: TenderState) -> dict:
         ))],
     }
 
-
-def evaluate_node(state: TenderState) -> dict:
-    """Node 2: EVALUATE — Score tender eligibility on 8 dimensions.
-
-    PLACEHOLDER: Returns a mock score of 75 (eligible). Real implementation
-    (Step 9) will:
-    - Send tender text to Claude Haiku 4.5 for fast classification
-    - Score 8 dimensions: geography, budget, scope, compliance,
-      timeline, certifications, domain match, competition level
-    - Each dimension scored 0-15, total 0-100
-    - Score ≥ 60 advances to drafting; below 60 is archived
-    """
-    logger.info("node_evaluate", tender_id=state.get("tender_id", "unknown"))
-
-    mock_breakdown = {
-        "geography": 10,
-        "budget": 8,
-        "scope": 9,
-        "compliance": 10,
-        "timeline": 8,
-        "certifications": 8,
-        "domain_match": 12,
-        "competition": 10,
-    }
-    mock_score = sum(mock_breakdown.values())
-
-    return {
-        "eval_score": mock_score,
-        "eval_breakdown": mock_breakdown,
-        "eval_decision": "go" if mock_score >= 60 else "no_go",
-        "eval_reasoning": f"Placeholder evaluation. Score: {mock_score}/100.",
-        "status": TenderStatus.ELIGIBLE.value if mock_score >= 60 else TenderStatus.REJECTED.value,
-        "current_node": "evaluate",
-        "audit_log": [_audit("evaluate", "tender_scored", (
-            f"Score: {mock_score}/100. Decision: {'GO' if mock_score >= 60 else 'NO-GO'}."
-        ))],
-    }
 
 
 def retrieve_draft_node(state: TenderState) -> dict:

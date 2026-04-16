@@ -43,6 +43,7 @@ import structlog
 from langgraph.graph import END, START, StateGraph
 
 from src.agent.state import TenderState, TenderStatus
+from src.agent.nodes.discover import discover_node as discover_node
 from src.agent.nodes.evaluate import evaluate_node as evaluate_node
 from src.agent.nodes.retrieve_draft import retrieve_draft_node as retrieve_draft_node
 from src.agent.nodes.gap_check import gap_check_node as gap_check_node
@@ -84,27 +85,6 @@ def _audit(node: str, action: str, detail: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def discover_node(state: TenderState) -> dict:
-    """Node 1: DISCOVER — Find new tenders from portals, RSS, and email.
-
-    PLACEHOLDER: Logs and passes through. Real implementation (Step 14) will:
-    - Scrape SAM.gov RSS feeds for new tender postings
-    - Check MERX and other procurement portals
-    - Monitor IMAP email for tender notifications
-    - Extract metadata (title, deadline, URL, category)
-    - Parse attached tender documents (PDF/DOCX)
-    - Store raw tender data in PostgreSQL
-    """
-    logger.info("node_discover", tender_id=state.get("tender_id", "unknown"))
-
-    return {
-        "status": TenderStatus.DISCOVERED.value,
-        "current_node": "discover",
-        "audit_log": [_audit("discover", "tender_discovered", (
-            f"Tender '{state.get('tender_title', 'N/A')}' discovered "
-            f"from {state.get('source_portal', 'unknown')}"
-        ))],
-    }
 
 
 

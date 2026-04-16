@@ -1,0 +1,45 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# === Virtual Environment ===
+.venv/
+venv/
+ENV/
+
+# === Secrets ===
+.env
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Data (large files, don't commit to Git) ===
+data/raw_tenders/
+data/company_docs/
+
+# === Generated outputs ===
+*.docx
+*.pdf
+!templates/*.docx
+!templates/*.pdf
+
+# === Playwright ===
+playwright-report/
+test-results/
+
+# === Coverage ===
+htmlcov/
+.coverage

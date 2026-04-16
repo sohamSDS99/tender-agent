@@ -44,6 +44,8 @@ from langgraph.graph import END, START, StateGraph
 
 from src.agent.state import TenderState, TenderStatus
 from src.agent.nodes.evaluate import evaluate_node as evaluate_node
+from src.agent.nodes.retrieve_draft import retrieve_draft_node as retrieve_draft_node
+from src.agent.nodes.gap_check import gap_check_node as gap_check_node
 
 logger = structlog.get_logger(__name__)
 
@@ -106,81 +108,7 @@ def discover_node(state: TenderState) -> dict:
 
 
 
-def retrieve_draft_node(state: TenderState) -> dict:
-    """Node 3: RETRIEVE & DRAFT — RAG retrieval + LLM section drafting.
 
-    PLACEHOLDER: Creates mock drafted sections. Real implementation (Step 10) will:
-    - Decompose tender requirements into sub-queries
-    - Search pgvector knowledge base using KnowledgeRetriever
-    - Route to Sonnet 4.6 for standard sections
-    - Route to Opus 4.6 Advisor for compliance-critical sections
-    - Draft each section with RAG-grounded content
-    - Track confidence scores and sources used
-    """
-    logger.info("node_retrieve_draft", tender_id=state.get("tender_id", "unknown"))
-
-    # Check if we're re-drafting after Slack escalation
-    escalation_count = state.get("escalation_count", 0)
-    is_redraft = escalation_count > 0
-
-    mock_sections = [
-        {
-            "section_id": "1.0",
-            "section_title": "Company Overview",
-            "content": "Acme SDS Solutions is a leading provider of SDS management software...",
-            "confidence": 0.90,
-            "sources_used": ["company_profile.pdf > Overview"],
-            "model_used": "claude-sonnet-4-6",
-            "token_count": 250,
-        },
-        {
-            "section_id": "2.0",
-            "section_title": "Technical Capabilities",
-            "content": "Our platform provides GHS classification, label generation...",
-            "confidence": 0.85,
-            "sources_used": ["company_profile.pdf > Capabilities"],
-            "model_used": "claude-sonnet-4-6",
-            "token_count": 400,
-        },
-    ]
-
-    detail = "Re-drafted sections with Slack responses" if is_redraft else "Drafted 2 sections"
-
-    return {
-        "drafted_sections": mock_sections,
-        "draft_rag_context": "[Placeholder RAG context]",
-        "status": TenderStatus.DRAFTING.value,
-        "current_node": "retrieve_draft",
-        "audit_log": [_audit("retrieve_draft", "sections_drafted", detail)],
-    }
-
-
-def gap_check_node(state: TenderState) -> dict:
-    """Node 4: GAP CHECK — Verify draft completeness against requirements.
-
-    PLACEHOLDER: Returns no gaps (pass). Real implementation (Step 11) will:
-    - Compare each drafted section against its tender requirement
-    - Check for missing data, outdated information, low confidence scores
-    - Verify all mandatory sections have content
-    - Check for fabricated/hallucinated claims not in the knowledge base
-    - Generate specific questions for any gaps found
-    """
-    logger.info("node_gap_check", tender_id=state.get("tender_id", "unknown"))
-
-    # Placeholder: no gaps found (clean pass)
-    # When we build the real implementation, this will actually analyse the draft
-    mock_gaps: list = []
-    passed = len(mock_gaps) == 0
-
-    return {
-        "gaps": mock_gaps,
-        "gap_check_passed": passed,
-        "status": TenderStatus.GAP_CHECK.value,
-        "current_node": "gap_check",
-        "audit_log": [_audit("gap_check", "gap_analysis_complete", (
-            f"{'No gaps found — ready for assembly.' if passed else f'{len(mock_gaps)} gaps identified.'}"
-        ))],
-    }
 
 
 def slack_escalate_node(state: TenderState) -> dict:

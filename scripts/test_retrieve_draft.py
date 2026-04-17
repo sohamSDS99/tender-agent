@@ -134,20 +134,21 @@ def test_3_compliance_routing() -> None:
     result = retrieve_draft_node(state)
     sections = result["drafted_sections"]
 
-    # At least one section should use Opus (the compliance one)
-    opus_sections = [s for s in sections if "opus" in s.get("model_used", "").lower()]
-    sonnet_sections = [s for s in sections if "sonnet" in s.get("model_used", "").lower()]
+    # At least one section should use Qwen3 Max (the compliance one)
+    # In dry-run, model_used is e.g. "qwen3-max-dry-run", so use startswith
+    advanced_sections = [s for s in sections if s.get("model_used", "").startswith("qwen3-max")]
+    standard_sections = [s for s in sections if s.get("model_used", "").startswith("qwen3.5-plus")]
 
-    assert len(opus_sections) >= 1, (
-        f"Expected ≥1 Opus-routed section, got {len(opus_sections)}"
+    assert len(advanced_sections) >= 1, (
+        f"Expected ≥1 Qwen3 Max-routed section, got {len(advanced_sections)}"
     )
-    assert len(sonnet_sections) >= 1, (
-        f"Expected ≥1 Sonnet-routed section, got {len(sonnet_sections)}"
+    assert len(standard_sections) >= 1, (
+        f"Expected ≥1 Qwen3.5 Plus-routed section, got {len(standard_sections)}"
     )
 
     print(
         f"  ✅ Test 3 passed: Multi-model routing works — "
-        f"{len(opus_sections)} Opus, {len(sonnet_sections)} Sonnet"
+        f"{len(advanced_sections)} Qwen3 Max, {len(standard_sections)} Qwen3.5 Plus"
     )
 
 
@@ -168,11 +169,11 @@ def test_4_redraft_preserves_good_sections() -> None:
         "drafted_sections": [
             {"section_id": "1.0", "section_title": "Company Overview",
              "content": "Original good draft for overview.", "confidence": 0.9,
-             "sources_used": ["profile.pdf"], "model_used": "claude-sonnet-4-6",
+             "sources_used": ["profile.pdf"], "model_used": "qwen3.5-plus",
              "token_count": 200},
             {"section_id": "3.0", "section_title": "Regulatory Compliance",
              "content": "Incomplete draft.", "confidence": 0.4,
-             "sources_used": [], "model_used": "claude-opus-4-6",
+             "sources_used": [], "model_used": "qwen3-max",
              "token_count": 100},
         ],
         "gaps": [

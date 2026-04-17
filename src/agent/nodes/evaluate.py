@@ -49,7 +49,7 @@ logger = structlog.get_logger(__name__)
 
 ELIGIBILITY_THRESHOLD: int = 60
 
-HAIKU_MODEL: str = "claude-haiku-4-5-20251001"
+HAIKU_MODEL: str = "qwen3.5-flash"
 
 # The scoring prompt sent to Haiku 4.5
 EVALUATION_PROMPT: str = """You are an expert tender evaluation analyst for a B2B SaaS company that provides Safety Data Sheet (SDS) management software, GHS classification tools, and EHS compliance services.
@@ -193,7 +193,7 @@ def _dry_run_score(tender_text: str) -> tuple[dict[str, int], str]:
 # ---------------------------------------------------------------------------
 
 def _llm_score(tender_text: str) -> tuple[dict[str, int], str, int]:
-    """Score a tender using Claude Haiku 4.5.
+    """Score a tender using Qwen3.5 Flash.
 
     Sends the tender text with a structured scoring prompt and parses
     the JSON response.
@@ -204,23 +204,31 @@ def _llm_score(tender_text: str) -> tuple[dict[str, int], str, int]:
     Raises:
         RuntimeError: If the API call fails or response can't be parsed.
     """
-    import anthropic
+    import os
+    from openai import OpenAI
 
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+    client = OpenAI(
+        api_key=os.environ["DASHSCOPE_API_KEY"],
+        base_url=os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ),
+    )
 
     prompt = EVALUATION_PROMPT.format(tender_text=tender_text[:6000])
     # Truncate at 6000 chars (~1500 tokens) to keep costs low.
-    # Haiku's context window is much larger, but we don't need the
-    # full tender text for a high-level eligibility assessment.
 
-    response = client.messages.create(
+    response = client.chat.completions.create(
         model=HAIKU_MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw_text = response.content[0].text.strip()
-    tokens_used = response.usage.input_tokens + response.usage.output_tokens
+    raw_text = (response.choices[0].message.content or "").strip()
+    tokens_used = (
+        (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0)
+        if response.usage else 0
+    )
 
     # Parse JSON response — handle possible markdown code fences
     clean_text = raw_text.strip()

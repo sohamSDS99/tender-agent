@@ -109,7 +109,7 @@ class AuditLogger:
             node="evaluate",
             action="tender_scored",
             detail="Score: 77/100. Decision: GO.",
-            model_used="claude-haiku-4-5-20251001",
+            model_used="qwen3.5-flash",
             tokens_used=1200,
         )
 

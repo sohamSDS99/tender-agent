@@ -30,13 +30,13 @@ def test_2_cost_recording():
     from src.utils.langsmith_config import CostTracker
     tracker = CostTracker()
     # Haiku call: 1000 input tokens, 500 output
-    # Price: $0.80/1M input + $4.00/1M output
-    cost = tracker.record("T-001", "claude-haiku-4-5-20251001", 1000, 500)
-    expected = (1000 / 1e6) * 0.80 + (500 / 1e6) * 4.00
+    # Price: $0.07/1M input + $0.26/1M output
+    cost = tracker.record("T-001", "qwen3.5-flash", 1000, 500)
+    expected = (1000 / 1e6) * 0.07 + (500 / 1e6) * 0.26
     assert abs(cost - expected) < 0.0001, f"Expected {expected}, got {cost}"
     # Sonnet call
-    cost2 = tracker.record("T-001", "claude-sonnet-4-6", 2000, 1000)
-    expected2 = (2000 / 1e6) * 3.00 + (1000 / 1e6) * 15.00
+    cost2 = tracker.record("T-001", "qwen3.5-plus", 2000, 1000)
+    expected2 = (2000 / 1e6) * 0.26 + (1000 / 1e6) * 1.56
     assert abs(cost2 - expected2) < 0.0001
     # Tender total
     tender_cost = tracker.get_tender_cost("T-001")
@@ -48,11 +48,11 @@ def test_3_record_from_audit():
     from src.utils.langsmith_config import CostTracker
     tracker = CostTracker()
     audit_log = [
-        {"node": "evaluate", "action": "scored", "model_used": "claude-haiku-4-5-20251001",
+        {"node": "evaluate", "action": "scored", "model_used": "qwen3.5-flash",
          "tokens_used": 1500, "timestamp": "2026-04-17T10:00:00Z"},
-        {"node": "retrieve_draft", "action": "drafted", "model_used": "claude-sonnet-4-6",
+        {"node": "retrieve_draft", "action": "drafted", "model_used": "qwen3.5-plus",
          "tokens_used": 5000, "timestamp": "2026-04-17T10:00:05Z"},
-        {"node": "gap_check", "action": "checked", "model_used": "claude-sonnet-4-6",
+        {"node": "gap_check", "action": "checked", "model_used": "qwen3.5-plus",
          "tokens_used": 2000, "timestamp": "2026-04-17T10:00:10Z"},
         {"node": "assemble", "action": "assembled", "model_used": None,
          "tokens_used": 0, "timestamp": "2026-04-17T10:00:15Z"},
@@ -68,10 +68,10 @@ def test_4_cost_report():
     """Test 4: Cost report aggregates by model and tender."""
     from src.utils.langsmith_config import CostTracker
     tracker = CostTracker()
-    tracker.record("T-A", "claude-haiku-4-5-20251001", 1000, 500)
-    tracker.record("T-A", "claude-sonnet-4-6", 3000, 1500)
-    tracker.record("T-B", "claude-haiku-4-5-20251001", 800, 400)
-    tracker.record("T-B", "claude-opus-4-6", 500, 200)
+    tracker.record("T-A", "qwen3.5-flash", 1000, 500)
+    tracker.record("T-A", "qwen3.5-plus", 3000, 1500)
+    tracker.record("T-B", "qwen3.5-flash", 800, 400)
+    tracker.record("T-B", "qwen3-max", 500, 200)
     report = tracker.get_report()
     assert report.total_calls == 4
     assert report.total_tokens == 1000+500+3000+1500+800+400+500+200
@@ -81,9 +81,9 @@ def test_4_cost_report():
     assert report.by_tender["T-B"] > 0
     formatted = tracker.format_report()
     assert "Cost Tracking Report" in formatted
-    assert "haiku" in formatted
-    assert "sonnet" in formatted
-    assert "opus" in formatted
+    assert "qwen3.5-flash" in formatted
+    assert "qwen3.5-plus" in formatted
+    assert "qwen3-max" in formatted
     assert "T-A" in formatted
     print(f"  ✅ Test 4 passed: Report has {report.total_calls} calls, {len(report.by_model)} models, ${report.total_cost:.4f}")
 
@@ -92,7 +92,7 @@ def test_5_budget_check():
     from src.utils.langsmith_config import CostTracker
     tracker = CostTracker()
     # Record minimal usage — well under budget
-    tracker.record("T-001", "claude-haiku-4-5-20251001", 1000, 500)
+    tracker.record("T-001", "qwen3.5-flash", 1000, 500)
     status = tracker.check_budget(monthly_budget=300.0)
     assert not status["warning"], "Should not warn at minimal usage"
     assert not status["exceeded"]
@@ -100,9 +100,10 @@ def test_5_budget_check():
     # Record huge usage to trigger warning
     tracker2 = CostTracker()
     for i in range(100):
-        tracker2.record(f"T-{i}", "claude-opus-4-6", 100_000, 50_000)
-    status2 = tracker2.check_budget(monthly_budget=300.0)
-    assert status2["warning"] or status2["exceeded"], "Should warn at heavy Opus usage"
+        tracker2.record(f"T-{i}", "qwen3-max", 100_000, 50_000)
+    # 100 calls × (100k/1M × $0.78 + 50k/1M × $3.90) ≈ $27.30 — use $25 budget to trigger warning
+    status2 = tracker2.check_budget(monthly_budget=25.0)
+    assert status2["warning"] or status2["exceeded"], "Should warn at heavy qwen3-max usage"
     print(f"  ✅ Test 5 passed: Budget check works (low=${status['spent']:.4f}, high=${status2['spent']:.2f})")
 
 def main():

@@ -52,7 +52,7 @@ logger = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-SONNET_MODEL: str = "claude-sonnet-4-6"
+SONNET_MODEL: str = "qwen3.5-plus"
 
 # Thresholds for heuristic gap detection
 CONFIDENCE_THRESHOLD: float = 0.7      # Below this = flag as gap
@@ -227,12 +227,13 @@ def _check_gaps_llm(
     requirements: list[TenderRequirement],
     sections: list[DraftedSection],
 ) -> tuple[list[GapItem], int]:
-    """Detect gaps using Claude Sonnet 4.6 for deeper analysis.
+    """Detect gaps using Qwen3.5 Plus for deeper analysis.
 
     Returns:
         Tuple of (gaps_list, tokens_used)
     """
-    import anthropic
+    import os
+    from openai import OpenAI
 
     # Build a combined JSON of requirements + drafts for the LLM
     combined = []
@@ -254,15 +255,24 @@ def _check_gaps_llm(
         sections_json=json.dumps(combined, indent=2)[:6000]
     )
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
+    client = OpenAI(
+        api_key=os.environ["DASHSCOPE_API_KEY"],
+        base_url=os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ),
+    )
+    response = client.chat.completions.create(
         model=SONNET_MODEL,
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw_text = response.content[0].text.strip()
-    tokens = response.usage.input_tokens + response.usage.output_tokens
+    raw_text = (response.choices[0].message.content or "").strip()
+    tokens = (
+        (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0)
+        if response.usage else 0
+    )
 
     clean_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
     clean_text = re.sub(r"\s*```$", "", clean_text)

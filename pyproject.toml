@@ -10,7 +10,7 @@ dependencies = [
     "langgraph-checkpoint-postgres>=2.0.0,<3.0.0",
 
     # === LLM ===
-    "anthropic>=0.52.0,<1.0.0",
+    "openai>=1.60.0",
 
     # === Embeddings ===
     "voyageai>=0.3.0,<1.0.0",

@@ -1,5 +1,5 @@
 """
-Tests the multi-model LLM client.
+Tests the multi-model LLM client (Qwen API via OpenAI-compatible SDK).
 
 Runs in dry-run mode so no API key or real API calls are needed.
 Verifies all 3 tiers, cost calculation, and the cost summary.
@@ -11,10 +11,9 @@ Usage:
 from src.utils.llm_client import (
     MultiModelClient,
     ModelTier,
-    ModelConfig,
-    MODEL_REGISTRY,
-    calculate_cost,
-    LLMResult,
+    LLMResponse,
+    LLMUsage,
+    MODEL_COSTS,
 )
 from src.utils.logger import setup_logging, get_logger
 
@@ -28,25 +27,23 @@ def test_cost_calculation() -> None:
     print("  TEST 1: Cost Calculation")
     print("=" * 60 + "\n")
 
-    config = MODEL_REGISTRY[ModelTier.FAST]  # Haiku: $1.00/$5.00 per 1M
-
-    # 1000 input tokens + 500 output tokens with Haiku
-    cost = calculate_cost(config, input_tokens=1000, output_tokens=500)
-    expected = (1000 / 1_000_000) * 1.00 + (500 / 1_000_000) * 5.00
+    # qwen3.5-flash: $0.07/$0.26 per 1M
+    cost = MultiModelClient._calculate_cost("qwen3.5-flash", input_tokens=1000, output_tokens=500)
+    expected = (1000 / 1_000_000) * 0.07 + (500 / 1_000_000) * 0.26
     assert abs(cost - expected) < 1e-10, f"Expected {expected}, got {cost}"
-    print(f"  Haiku: 1000 in + 500 out = ${cost:.6f} (expected ${expected:.6f})")
+    print(f"  qwen3.5-flash: 1000 in + 500 out = ${cost:.6f} (expected ${expected:.6f})")
 
-    config = MODEL_REGISTRY[ModelTier.STANDARD]  # Sonnet: $3.00/$15.00 per 1M
-    cost = calculate_cost(config, input_tokens=500, output_tokens=400)
-    expected = (500 / 1_000_000) * 3.00 + (400 / 1_000_000) * 15.00
+    # qwen3.5-plus: $0.26/$1.56 per 1M
+    cost = MultiModelClient._calculate_cost("qwen3.5-plus", input_tokens=500, output_tokens=400)
+    expected = (500 / 1_000_000) * 0.26 + (400 / 1_000_000) * 1.56
     assert abs(cost - expected) < 1e-10
-    print(f"  Sonnet: 500 in + 400 out = ${cost:.6f}")
+    print(f"  qwen3.5-plus:  500 in + 400 out = ${cost:.6f}")
 
-    config = MODEL_REGISTRY[ModelTier.ADVANCED]  # Opus: $15.00/$75.00 per 1M
-    cost = calculate_cost(config, input_tokens=800, output_tokens=600)
-    expected = (800 / 1_000_000) * 15.00 + (600 / 1_000_000) * 75.00
+    # qwen3-max: $0.78/$3.90 per 1M
+    cost = MultiModelClient._calculate_cost("qwen3-max", input_tokens=800, output_tokens=600)
+    expected = (800 / 1_000_000) * 0.78 + (600 / 1_000_000) * 3.90
     assert abs(cost - expected) < 1e-10
-    print(f"  Opus: 800 in + 600 out = ${cost:.6f}")
+    print(f"  qwen3-max:     800 in + 600 out = ${cost:.6f}")
 
     print("\n  TEST 1 PASSED: Cost calculation is correct.\n")
 
@@ -60,49 +57,47 @@ def test_dry_run_calls() -> None:
     # Force dry_run=True regardless of .env setting
     client = MultiModelClient(dry_run=True)
 
-    # Test FAST tier (Haiku)
-    result = client.call(
+    # Test FAST tier (qwen3.5-flash)
+    result = client.complete(
         prompt="Is this tender relevant to EHS software?",
         tier=ModelTier.FAST,
-        system="You are a classifier.",
+        system_prompt="You are a classifier.",
     )
-    assert isinstance(result, LLMResult)
-    assert result.is_mock is True
-    assert result.model_id == "claude-haiku-4-5-20251001"
-    assert result.tokens_input > 0
-    assert result.cost_usd > 0
-    assert len(result.text) > 0
-    print(f"  FAST (Haiku):     {result.model_id}")
-    print(f"    Response: {result.text[:80]}...")
-    print(f"    Cost: ${result.cost_usd:.6f}")
+    assert isinstance(result, LLMResponse)
+    assert result.model == "qwen3.5-flash"
+    assert result.usage.input_tokens > 0
+    assert result.usage.cost_usd > 0
+    assert len(result.content) > 0
+    assert "DRY-RUN" in result.content
+    print(f"  FAST (qwen3.5-flash):     {result.model}")
+    print(f"    Response: {result.content[:80]}...")
+    print(f"    Cost: ${result.usage.cost_usd:.6f}")
 
-    # Test STANDARD tier (Sonnet)
-    result = client.call(
+    # Test STANDARD tier (qwen3.5-plus)
+    result = client.complete(
         prompt="Draft the executive summary.",
         tier=ModelTier.STANDARD,
     )
-    assert result.model_id == "claude-sonnet-4-6"
-    assert result.is_mock is True
-    print(f"\n  STANDARD (Sonnet): {result.model_id}")
-    print(f"    Response: {result.text[:80]}...")
-    print(f"    Cost: ${result.cost_usd:.6f}")
+    assert result.model == "qwen3.5-plus"
+    print(f"\n  STANDARD (qwen3.5-plus):  {result.model}")
+    print(f"    Response: {result.content[:80]}...")
+    print(f"    Cost: ${result.usage.cost_usd:.6f}")
 
-    # Test ADVANCED tier (Opus)
-    result = client.call(
+    # Test ADVANCED tier (qwen3-max)
+    result = client.complete(
         prompt="Analyse compliance requirements.",
         tier=ModelTier.ADVANCED,
     )
-    assert result.model_id == "claude-opus-4-6"
-    assert result.is_mock is True
-    print(f"\n  ADVANCED (Opus):  {result.model_id}")
-    print(f"    Response: {result.text[:80]}...")
-    print(f"    Cost: ${result.cost_usd:.6f}")
+    assert result.model == "qwen3-max"
+    print(f"\n  ADVANCED (qwen3-max):     {result.model}")
+    print(f"    Response: {result.content[:80]}...")
+    print(f"    Cost: ${result.usage.cost_usd:.6f}")
 
     # Verify cumulative tracking
-    assert client.total_calls == 3
-    assert client.total_cost > 0
-    print(f"\n  Total calls: {client.total_calls}")
-    print(f"  Total cost:  ${client.total_cost:.6f}")
+    assert client.call_count == 3
+    assert client.total_cost_usd > 0
+    print(f"\n  Total calls: {client.call_count}")
+    print(f"  Total cost:  ${client.total_cost_usd:.6f}")
 
     print("\n  TEST 2 PASSED: All 3 tiers return correct mock responses.\n")
 
@@ -116,55 +111,58 @@ def test_cost_summary() -> None:
     client = MultiModelClient(dry_run=True)
 
     # Make a few calls
-    client.call("test1", tier=ModelTier.FAST)
-    client.call("test2", tier=ModelTier.STANDARD)
-    client.call("test3", tier=ModelTier.ADVANCED)
-    client.call("test4", tier=ModelTier.FAST)
+    client.complete("test1", tier=ModelTier.FAST)
+    client.complete("test2", tier=ModelTier.STANDARD)
+    client.complete("test3", tier=ModelTier.ADVANCED)
+    client.complete("test4", tier=ModelTier.FAST)
 
     summary = client.get_cost_summary()
 
-    assert summary["total_calls"] == 4
+    assert summary["call_count"] == 4
     assert summary["total_cost_usd"] > 0
-    assert summary["mode"] == "dry_run"
-    assert "fast" in summary["models_available"]
-    assert "standard" in summary["models_available"]
-    assert "advanced" in summary["models_available"]
+    assert summary["total_input_tokens"] > 0
+    assert summary["total_output_tokens"] > 0
 
     print(f"  Summary: {summary}")
 
     print("\n  TEST 3 PASSED: Cost summary is correct.\n")
 
 
-def test_model_registry() -> None:
-    """Verify all models are properly configured."""
+def test_model_tiers() -> None:
+    """Verify all model tiers map to correct Qwen model strings."""
     print("=" * 60)
-    print("  TEST 4: Model Registry")
+    print("  TEST 4: Model Tiers")
     print("=" * 60 + "\n")
 
-    for tier in ModelTier:
-        assert tier in MODEL_REGISTRY, f"Missing model config for {tier}"
-        config = MODEL_REGISTRY[tier]
-        assert config.model_id, f"Empty model_id for {tier}"
-        assert config.cost_per_1m_input > 0, f"Invalid input cost for {tier}"
-        assert config.cost_per_1m_output > 0, f"Invalid output cost for {tier}"
-        assert config.default_max_tokens > 0, f"Invalid max_tokens for {tier}"
-        print(f"  {tier.value:12s} -> {config.model_id:35s} (${config.cost_per_1m_input}/{config.cost_per_1m_output} per 1M)")
+    expected = {
+        ModelTier.FAST: "qwen3.5-flash",
+        ModelTier.STANDARD: "qwen3.5-plus",
+        ModelTier.ADVANCED: "qwen3-max",
+    }
 
-    print("\n  TEST 4 PASSED: All models properly configured.\n")
+    for tier, model_id in expected.items():
+        assert tier.value == model_id, f"Expected {model_id}, got {tier.value}"
+        assert model_id in MODEL_COSTS, f"Missing pricing for {model_id}"
+        costs = MODEL_COSTS[model_id]
+        assert costs["input"] > 0
+        assert costs["output"] > 0
+        print(f"  {tier.name:12s} -> {model_id:20s} (${costs['input']}/{costs['output']} per 1M)")
+
+    print("\n  TEST 4 PASSED: All model tiers correctly configured.\n")
 
 
 if __name__ == "__main__":
     print("\n" + "#" * 60)
-    print("  MULTI-MODEL LLM CLIENT — VERIFICATION SUITE")
+    print("  MULTI-MODEL LLM CLIENT (QWEN) — VERIFICATION SUITE")
     print("#" * 60)
 
     test_cost_calculation()
     test_dry_run_calls()
     test_cost_summary()
-    test_model_registry()
+    test_model_tiers()
 
     print("=" * 60)
     print("  ALL 4 TESTS PASSED")
-    print("  Multi-model client with cost tracking verified")
+    print("  Multi-model Qwen client with cost tracking verified")
     print("=" * 60)
     print()

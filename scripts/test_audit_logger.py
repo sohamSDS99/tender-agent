@@ -13,7 +13,7 @@ def test_1_log_single_entry():
     audit = AuditLogger()
     entry = audit.log(
         tender_id="TEST-001", node="evaluate", action="tender_scored",
-        detail="Score: 77/100. Decision: GO.", model_used="claude-haiku-4-5",
+        detail="Score: 77/100. Decision: GO.", model_used="qwen3.5-flash",
         tokens_used=1200,
     )
     assert entry.tender_id == "TEST-001"
@@ -35,10 +35,10 @@ def test_2_persist_from_state():
          "model_used": None, "tokens_used": None},
         {"timestamp": "2026-04-17T10:00:01Z", "node": "evaluate",
          "action": "tender_scored", "detail": "Score: 77/100",
-         "model_used": "claude-haiku-4-5", "tokens_used": 1200},
+         "model_used": "qwen3.5-flash", "tokens_used": 1200},
         {"timestamp": "2026-04-17T10:00:05Z", "node": "retrieve_draft",
          "action": "sections_drafted", "detail": "Drafted 5 sections",
-         "model_used": "claude-sonnet-4-6", "tokens_used": 4500},
+         "model_used": "qwen3.5-plus", "tokens_used": 4500},
     ]
     count = audit.persist_from_state("TEST-002", state_log)
     assert count == 3, f"Expected 3, got {count}"

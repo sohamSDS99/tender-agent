@@ -6,7 +6,7 @@ and exposes them as typed attributes on a Settings object.
 
 Usage:
     from src.utils.config import settings
-    print(settings.anthropic_api_key)
+    print(settings.dashscope_api_key)
 """
 
 from __future__ import annotations
@@ -48,8 +48,13 @@ class Settings:
     which prevents bugs from code accidentally modifying config at runtime.
     """
 
-    # --- Anthropic API ---
-    anthropic_api_key: str = field(default_factory=lambda: _require_env("ANTHROPIC_API_KEY"))
+    # --- Qwen / DashScope API ---
+    dashscope_api_key: str = field(default_factory=lambda: _optional_env("DASHSCOPE_API_KEY"))
+    qwen_base_url: str = field(
+        default_factory=lambda: _optional_env(
+            "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        )
+    )
 
     # --- Voyage AI ---
     voyage_api_key: str = field(default_factory=lambda: _require_env("VOYAGE_API_KEY"))

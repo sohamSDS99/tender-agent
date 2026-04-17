@@ -11,16 +11,16 @@ def _make_sections():
     return [
         {"section_id": "1.0", "section_title": "Company Overview",
          "content": "Acme SDS Solutions is a leading provider of Safety Data Sheet management software, serving over 500 clients across manufacturing, construction, oil and gas, and pharmaceutical industries. Founded with a mission to simplify chemical safety compliance, our platform provides comprehensive SDS management capabilities trusted by organizations of all sizes.",
-         "confidence": 0.92, "sources_used": ["profile.pdf"], "model_used": "claude-sonnet-4-6", "token_count": 200},
+         "confidence": 0.92, "sources_used": ["profile.pdf"], "model_used": "qwen3.5-plus", "token_count": 200},
         {"section_id": "2.0", "section_title": "Technical Capabilities",
          "content": "Our platform provides cloud-based SDS management including GHS classification, chemical inventory tracking across multiple facilities, automated regulatory reporting (OSHA Tier II, EPCRA/CERCLA), and mobile access via QR codes and native apps. We support OSHA HCS, WHMIS, CLP/REACH, and over 140 global regulatory jurisdictions.",
-         "confidence": 0.88, "sources_used": ["caps.pdf"], "model_used": "claude-sonnet-4-6", "token_count": 250},
+         "confidence": 0.88, "sources_used": ["caps.pdf"], "model_used": "qwen3.5-plus", "token_count": 250},
         {"section_id": "3.0", "section_title": "Compliance & Certifications",
          "content": "Acme SDS Solutions holds ISO 27001 certification for information security and maintains SOC 2 Type II compliance, verified annually by independent auditors. Our data centres operate in AWS US-East and AWS EU-West regions, providing 99.95% uptime SLA with full data redundancy.",
-         "confidence": 0.85, "sources_used": ["certs.pdf"], "model_used": "claude-opus-4-6", "token_count": 300},
+         "confidence": 0.85, "sources_used": ["certs.pdf"], "model_used": "qwen3-max", "token_count": 300},
         {"section_id": "4.0", "section_title": "Implementation Approach",
          "content": "Our standard implementation follows a proven 12-week methodology: Week 1-2 Discovery and requirements. Week 3-4 System configuration and data migration planning. Week 5-8 Data migration and integration. Week 9-10 User acceptance testing. Week 11-12 Training and go-live. Post-launch support for 90 days.",
-         "confidence": 0.90, "sources_used": ["impl.pdf"], "model_used": "claude-sonnet-4-6", "token_count": 220},
+         "confidence": 0.90, "sources_used": ["impl.pdf"], "model_used": "qwen3.5-plus", "token_count": 220},
     ]
 
 def test_1_standard_assembly():

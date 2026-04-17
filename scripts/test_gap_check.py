@@ -47,7 +47,7 @@ def test_1_clean_draft_passes() -> None:
                  "industries with our cloud-based platform."
              ),
              "confidence": 0.90, "sources_used": ["profile.pdf"],
-             "model_used": "claude-sonnet-4-6", "token_count": 200},
+             "model_used": "qwen3.5-plus", "token_count": 200},
             {"section_id": "2.0", "section_title": "Capabilities",
              "content": (
                  "Our platform provides comprehensive SDS management including GHS "
@@ -56,7 +56,7 @@ def test_1_clean_draft_passes() -> None:
                  "WHMIS, CLP/REACH, and over 140 global jurisdictions."
              ),
              "confidence": 0.88, "sources_used": ["capabilities.pdf"],
-             "model_used": "claude-sonnet-4-6", "token_count": 250},
+             "model_used": "qwen3.5-plus", "token_count": 250},
         ],
         "audit_log": [],
         "error_messages": [],
@@ -90,7 +90,7 @@ def test_2_low_confidence_detected() -> None:
                  "your specific needs and requirements."
              ),
              "confidence": 0.45, "sources_used": [],
-             "model_used": "claude-sonnet-4-6", "token_count": 100},
+             "model_used": "qwen3.5-plus", "token_count": 100},
         ],
         "audit_log": [],
         "error_messages": [],
@@ -133,7 +133,7 @@ def test_3_placeholder_markers_detected() -> None:
                  "Additionally, [INFORMATION NEEDED: FedRAMP authorization status]."
              ),
              "confidence": 0.72, "sources_used": ["certs.pdf"],
-             "model_used": "claude-sonnet-4-6", "token_count": 150},
+             "model_used": "qwen3.5-plus", "token_count": 150},
         ],
         "audit_log": [],
         "error_messages": [],
@@ -176,7 +176,7 @@ def test_4_missing_mandatory_section() -> None:
                  "serving over 500 clients across multiple industries worldwide."
              ),
              "confidence": 0.90, "sources_used": ["profile.pdf"],
-             "model_used": "claude-sonnet-4-6", "token_count": 100},
+             "model_used": "qwen3.5-plus", "token_count": 100},
         ],
         "audit_log": [],
         "error_messages": [],

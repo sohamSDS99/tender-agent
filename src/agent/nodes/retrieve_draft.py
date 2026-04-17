@@ -66,8 +66,8 @@ logger = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-SONNET_MODEL: str = "claude-sonnet-4-6"
-OPUS_MODEL: str = "claude-opus-4-6"
+SONNET_MODEL: str = "qwen3.5-plus"
+OPUS_MODEL: str = "qwen3-max"
 
 # Keywords that trigger Opus routing for compliance-critical sections
 COMPLIANCE_KEYWORDS: set[str] = {
@@ -255,21 +255,28 @@ def _draft_section_dry_run(
 # ---------------------------------------------------------------------------
 
 def _extract_requirements_llm(tender_text: str) -> list[TenderRequirement]:
-    """Extract requirements using Claude Sonnet 4.6."""
-    import anthropic
+    """Extract requirements using Qwen3.5 Plus."""
+    import os
+    from openai import OpenAI
 
-    client = anthropic.Anthropic()
+    client = OpenAI(
+        api_key=os.environ["DASHSCOPE_API_KEY"],
+        base_url=os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ),
+    )
     prompt = REQUIREMENT_EXTRACTION_PROMPT.format(
         tender_text=tender_text[:8000]
     )
 
-    response = client.messages.create(
+    response = client.chat.completions.create(
         model=SONNET_MODEL,
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw_text = response.content[0].text.strip()
+    raw_text = (response.choices[0].message.content or "").strip()
     clean_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
     clean_text = re.sub(r"\s*```$", "", clean_text)
 
@@ -288,14 +295,21 @@ def _draft_section_llm(
     slack_context: str,
     is_compliance: bool,
 ) -> tuple[DraftedSection, int]:
-    """Draft a section using Claude Sonnet 4.6 or Opus 4.6.
+    """Draft a section using Qwen3.5 Plus or Qwen3 Max.
 
     Returns:
         Tuple of (DraftedSection, tokens_used)
     """
-    import anthropic
+    import os
+    from openai import OpenAI
 
-    client = anthropic.Anthropic()
+    client = OpenAI(
+        api_key=os.environ["DASHSCOPE_API_KEY"],
+        base_url=os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ),
+    )
     model = OPUS_MODEL if is_compliance else SONNET_MODEL
 
     prompt = SECTION_DRAFT_PROMPT.format(
@@ -306,14 +320,17 @@ def _draft_section_llm(
         slack_context=slack_context,
     )
 
-    response = client.messages.create(
+    response = client.chat.completions.create(
         model=model,
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    content = response.content[0].text.strip()
-    tokens = response.usage.input_tokens + response.usage.output_tokens
+    content = (response.choices[0].message.content or "").strip()
+    tokens = (
+        (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0)
+        if response.usage else 0
+    )
 
     # Estimate confidence based on context quality
     has_info_gaps = "[INFORMATION NEEDED:" in content
@@ -508,8 +525,8 @@ def retrieve_draft_node(state: TenderState) -> dict:
             "detail": (
                 f"{'Re-drafted' if is_redraft else 'Drafted'} {len(drafted_sections)} sections. "
                 f"Tokens used: {total_tokens}. "
-                f"Compliance sections routed to Opus: "
-                f"{sum(1 for s in drafted_sections if 'opus' in s.get('model_used', '').lower())}."
+                f"Compliance sections routed to Qwen3 Max: "
+                f"{sum(1 for s in drafted_sections if s.get('model_used', '') == OPUS_MODEL)}."
             ),
             "model_used": f"{SONNET_MODEL}+{OPUS_MODEL}",
             "tokens_used": total_tokens,

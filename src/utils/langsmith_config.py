@@ -56,14 +56,14 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
-    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    "qwen3.5-flash": {"input": 0.07, "output": 0.26},
+    "qwen3.5-plus":  {"input": 0.26, "output": 1.56},
+    "qwen3-max":     {"input": 0.78, "output": 3.90},
     "voyage-3-large": {"input": 0.06, "output": 0.0},
     # Dry-run variants (same pricing for estimation)
-    "claude-haiku-4-5-20251001-dry-run": {"input": 0.80, "output": 4.00},
-    "claude-sonnet-4-6-dry-run": {"input": 3.00, "output": 15.00},
-    "claude-opus-4-6-dry-run": {"input": 15.00, "output": 75.00},
+    "qwen3.5-flash-dry-run": {"input": 0.07, "output": 0.26},
+    "qwen3.5-plus-dry-run":  {"input": 0.26, "output": 1.56},
+    "qwen3-max-dry-run":     {"input": 0.78, "output": 3.90},
     "voyage-3-large-dry-run": {"input": 0.06, "output": 0.0},
 }
 
@@ -187,7 +187,7 @@ class CostTracker:
         # Record usage from a node
         tracker.record(
             tender_id="SAM-2026-001",
-            model="claude-sonnet-4-6",
+            model="qwen3.5-plus",
             input_tokens=1500,
             output_tokens=800,
         )

@@ -106,7 +106,7 @@ class DraftedSection(TypedDict, total=False):
             "content": "Our platform provides comprehensive GHS classification...",
             "confidence": 0.85,
             "sources_used": ["company_profile.pdf > Certifications"],
-            "model_used": "claude-sonnet-4-6",
+            "model_used": "qwen3.5-plus",
             "token_count": 420,
         }
     """
@@ -148,7 +148,7 @@ class AuditEntry(TypedDict, total=False):
             "node": "evaluate",
             "action": "scored_tender",
             "detail": "Score 78/100 — eligible. Geography: 10, Domain: 9, ...",
-            "model_used": "claude-haiku-4-5-20251001",
+            "model_used": "qwen3.5-flash",
             "tokens_used": 1200,
         }
     """

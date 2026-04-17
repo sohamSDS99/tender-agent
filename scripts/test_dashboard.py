@@ -16,7 +16,7 @@ def _make_completed_state(tender_id, title, score, decision, status, sections=3,
         "eval_score": score,
         "eval_decision": decision,
         "drafted_sections": [{"section_id": f"{i}.0", "section_title": f"Sec {i}", "content": "x"*100,
-                               "confidence": 0.85, "sources_used": [], "model_used": "sonnet", "token_count": 200}
+                               "confidence": 0.85, "sources_used": [], "model_used": "qwen3.5-plus", "token_count": 200}
                               for i in range(1, sections+1)],
         "gaps": [{"section_id": "1.0", "description": "gap", "severity": "high", "suggested_question": "?"}] * gaps,
         "escalation_count": escalations,
@@ -26,11 +26,11 @@ def _make_completed_state(tender_id, title, score, decision, status, sections=3,
             {"timestamp": "2026-04-17T10:00:00Z", "node": "discover", "action": "discovered",
              "detail": "Found", "model_used": None, "tokens_used": 0},
             {"timestamp": "2026-04-17T10:00:01Z", "node": "evaluate", "action": "scored",
-             "detail": f"Score: {score}", "model_used": "claude-haiku-4-5-20251001", "tokens_used": 1200},
+             "detail": f"Score: {score}", "model_used": "qwen3.5-flash", "tokens_used": 1200},
             {"timestamp": "2026-04-17T10:00:05Z", "node": "retrieve_draft", "action": "drafted",
-             "detail": f"Drafted {sections}", "model_used": "claude-sonnet-4-6", "tokens_used": 4500},
+             "detail": f"Drafted {sections}", "model_used": "qwen3.5-plus", "tokens_used": 4500},
             {"timestamp": "2026-04-17T10:00:10Z", "node": "gap_check", "action": "checked",
-             "detail": "Checked", "model_used": "claude-sonnet-4-6", "tokens_used": 800},
+             "detail": "Checked", "model_used": "qwen3.5-plus", "tokens_used": 800},
             {"timestamp": "2026-04-17T10:00:15Z", "node": "assemble", "action": "assembled",
              "detail": "Done", "model_used": None, "tokens_used": 0},
             {"timestamp": "2026-04-17T10:00:20Z", "node": "submit", "action": "submitted",
@@ -72,8 +72,8 @@ def test_3_cost_aggregation():
     dash.record_run(_make_completed_state("C-001", "Tender A", 80, "go", "submitted"))
     dash.record_run(_make_completed_state("C-002", "Tender B", 75, "go", "submitted"))
     cost_report = dash.format_cost_report()
-    assert "haiku" in cost_report
-    assert "sonnet" in cost_report
+    assert "qwen3.5-flash" in cost_report
+    assert "qwen3.5-plus" in cost_report
     assert "C-001" in cost_report
     assert "C-002" in cost_report
     budget = dash.get_budget_status()
@@ -84,7 +84,7 @@ def test_3_cost_aggregation():
 def test_4_budget_warning():
     """Test 4: Budget warning triggers at 80% usage."""
     from src.utils.dashboard import CostDashboard
-    dash = CostDashboard(monthly_budget=0.01)  # Tiny budget
+    dash = CostDashboard(monthly_budget=0.001)  # Tiny budget — Qwen is much cheaper than Claude
     dash.record_run(_make_completed_state("B-001", "Test", 80, "go", "submitted"))
     status = dash.get_budget_status()
     assert status["exceeded"], "Should exceed tiny budget"

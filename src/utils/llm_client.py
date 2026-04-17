@@ -1,417 +1,245 @@
 """
-Anthropic multi-model client with cost tracking and dry-run support.
+Multi-model LLM client using Qwen API (OpenAI-compatible).
 
-This is the single entry point for all LLM calls in the agent.
-Every node calls this module instead of using the Anthropic SDK directly.
+Replaces the Anthropic-based client. Uses the openai SDK pointed
+at Alibaba Cloud's DashScope endpoint.
 
-Usage:
-    from src.utils.llm_client import llm_client, ModelTier
-
-    # Quick scoring with Haiku (cheapest)
-    result = llm_client.call(
-        prompt="Is this tender relevant to EHS software?",
-        tier=ModelTier.FAST,
-        system="You are a tender eligibility classifier.",
-    )
-    print(result.text)
-    print(f"Cost: ${result.cost_usd:.6f}")
-
-    # Drafting with Sonnet (balanced)
-    result = llm_client.call(
-        prompt="Draft the executive summary section.",
-        tier=ModelTier.STANDARD,
-        system="You are a professional bid writer.",
-        max_tokens=2000,
-    )
-
-    # Complex compliance analysis with Opus (most capable)
-    result = llm_client.call(
-        prompt="Analyse whether our ISO 27001 cert meets this requirement.",
-        tier=ModelTier.ADVANCED,
-        system="You are a compliance advisor.",
-    )
+Model tiers:
+  FAST     -> qwen3.5-flash   (scoring, classification)
+  STANDARD -> qwen3.5-plus    (section drafting, RAG Q&A)
+  ADVANCED -> qwen3-max       (compliance reasoning)
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+import logging
 from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional
 
-from anthropic import Anthropic
+from openai import OpenAI
 
-from src.utils.config import settings
-from src.utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-
-# =============================================================================
-# MODEL CONFIGURATION
-# =============================================================================
-
-class ModelTier(Enum):
-    """
-    Model tiers map to cost/capability levels.
-
-    Nodes specify the TIER they need, not the model name.
-    This means we can swap models without changing node code.
-    """
-
-    FAST = "fast"           # Haiku — scoring, classification
-    STANDARD = "standard"   # Sonnet — drafting, RAG Q&A
-    ADVANCED = "advanced"   # Opus — compliance reasoning
+logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class ModelConfig:
-    """Configuration for a specific model."""
-
-    model_id: str               # API model string
-    display_name: str           # Human-readable name for logs
-    cost_per_1m_input: float    # USD per 1 million input tokens
-    cost_per_1m_output: float   # USD per 1 million output tokens
-    default_max_tokens: int     # Default max output tokens
+class ModelTier(str, Enum):
+    """Maps business purpose to a specific Qwen model."""
+    FAST = "qwen3.5-flash"
+    STANDARD = "qwen3.5-plus"
+    ADVANCED = "qwen3-max"
 
 
-# Model registry — update these when Anthropic releases new models or changes pricing
-MODEL_REGISTRY: dict[ModelTier, ModelConfig] = {
-    ModelTier.FAST: ModelConfig(
-        model_id="claude-haiku-4-5-20251001",
-        display_name="Claude Haiku 4.5",
-        cost_per_1m_input=1.00,
-        cost_per_1m_output=5.00,
-        default_max_tokens=1024,
-    ),
-    ModelTier.STANDARD: ModelConfig(
-        model_id="claude-sonnet-4-6",
-        display_name="Claude Sonnet 4.6",
-        cost_per_1m_input=3.00,
-        cost_per_1m_output=15.00,
-        default_max_tokens=4096,
-    ),
-    ModelTier.ADVANCED: ModelConfig(
-        model_id="claude-opus-4-6",
-        display_name="Claude Opus 4.6",
-        cost_per_1m_input=15.00,
-        cost_per_1m_output=75.00,
-        default_max_tokens=4096,
-    ),
+# Cost per 1M tokens (USD)
+MODEL_COSTS = {
+    "qwen3.5-flash":  {"input": 0.07,  "output": 0.26},
+    "qwen3.5-plus":   {"input": 0.26,  "output": 1.56},
+    "qwen3-max":      {"input": 0.78,  "output": 3.90},
 }
 
-
-# =============================================================================
-# RESPONSE DATACLASS
-# =============================================================================
 
 @dataclass
-class LLMResult:
-    """
-    Structured result from an LLM call.
-
-    Every field here maps to a column in the AuditLog table,
-    so logging is just a matter of passing this object.
-    """
-
-    text: str                   # The model's text response
-    model_id: str               # Which model was used
-    model_tier: ModelTier       # Which tier was requested
-    tokens_input: int           # Input tokens consumed
-    tokens_output: int          # Output tokens generated
-    cost_usd: float             # Total cost of this call in USD
-    latency_ms: int             # Wall-clock time in milliseconds
-    is_mock: bool = False       # True if this was a dry-run response
-
-    def __repr__(self) -> str:
-        return (
-            f"<LLMResult(model='{self.model_id}', "
-            f"tokens={self.tokens_input}+{self.tokens_output}, "
-            f"cost=${self.cost_usd:.6f}, latency={self.latency_ms}ms)>"
-        )
+class LLMUsage:
+    """Token usage from a single LLM call."""
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_ms: float
 
 
-# =============================================================================
-# COST CALCULATOR
-# =============================================================================
-
-def calculate_cost(
-    config: ModelConfig,
-    input_tokens: int,
-    output_tokens: int,
-) -> float:
-    """
-    Calculate the cost of an LLM call in USD.
-
-    Args:
-        config: The model configuration with pricing.
-        input_tokens: Number of input tokens.
-        output_tokens: Number of output tokens.
-
-    Returns:
-        Cost in USD (e.g., 0.000453).
-    """
-    input_cost = (input_tokens / 1_000_000) * config.cost_per_1m_input
-    output_cost = (output_tokens / 1_000_000) * config.cost_per_1m_output
-    return input_cost + output_cost
+@dataclass
+class LLMResponse:
+    """Standardised response from any model tier."""
+    content: str
+    usage: LLMUsage
+    model: str
+    stop_reason: Optional[str] = None
 
 
-# =============================================================================
-# MOCK RESPONSES (for dry-run mode)
-# =============================================================================
-
-# These mock responses are realistic enough to test the full pipeline
-# without making API calls. Each tier returns a different style of response.
-MOCK_RESPONSES: dict[ModelTier, str] = {
-    ModelTier.FAST: (
-        '{"score": 72, "eligible": true, '
-        '"reasoning": "This tender matches our EHS software capabilities. '
-        'Geography: US (supported). Budget: within range. '
-        'Scope: SDS management software procurement. '
-        'Domain match: high."}'
-    ),
-    ModelTier.STANDARD: (
-        "Our company brings over a decade of experience in chemical safety "
-        "and SDS management to this procurement. Our cloud-based platform "
-        "currently serves 500+ organisations across manufacturing, construction, "
-        "and pharmaceuticals. We provide GHS-compliant Safety Data Sheet management, "
-        "automated regulatory reporting (OSHA Tier II, EPCRA/CERCLA), and mobile "
-        "access via QR codes and dedicated apps. Our solution has demonstrated "
-        "a 40% reduction in compliance audit preparation time for existing clients."
-    ),
-    ModelTier.ADVANCED: (
-        "COMPLIANCE ANALYSIS:\n\n"
-        "Requirement: ISO 27001 Information Security Management certification.\n"
-        "Status: COMPLIANT\n"
-        "Evidence: Our company holds ISO 27001:2022 certification (Certificate #IS-2025-0042), "
-        "valid through March 2027. The certification covers our cloud infrastructure, "
-        "data processing operations, and customer data handling procedures.\n\n"
-        "Requirement: SOC 2 Type II audit report.\n"
-        "Status: PARTIAL - Needs verification.\n"
-        "Note: Our most recent SOC 2 Type II report covers the period ending June 2025. "
-        "The tender requires a report no older than 12 months. Recommend escalation to "
-        "confirm if a more recent audit is available or in progress."
-    ),
-}
-
-
-# =============================================================================
-# THE CLIENT
-# =============================================================================
-
+@dataclass
 class MultiModelClient:
     """
-    Multi-model Anthropic client with cost tracking.
+    Unified client that routes requests to the appropriate Qwen model
+    based on the requested tier.
 
-    Handles:
-    - Model routing based on tier (FAST/STANDARD/ADVANCED)
-    - Token counting and cost calculation
-    - Dry-run mode for testing without API keys
-    - Structured logging of every call
-    - Cumulative cost tracking across the session
+    In dry-run mode (no API key), returns deterministic mock responses
+    so you can test the full pipeline without spending money.
     """
 
-    def __init__(self, dry_run: bool | None = None) -> None:
-        """
-        Initialise the client.
+    api_key: str = ""
+    base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    dry_run: bool = True
+    _client: Optional[OpenAI] = field(default=None, init=False, repr=False)
 
-        Args:
-            dry_run: If True, return mock responses instead of calling the API.
-                     If None (default), uses the DRY_RUN setting from .env.
-        """
-        self.dry_run = dry_run if dry_run is not None else settings.dry_run
+    # Running cost accumulator
+    total_cost_usd: float = field(default=0.0, init=False)
+    total_input_tokens: int = field(default=0, init=False)
+    total_output_tokens: int = field(default=0, init=False)
+    call_count: int = field(default=0, init=False)
 
-        # Cumulative cost tracker for the session
-        self._total_cost: float = 0.0
-        self._total_calls: int = 0
-
-        # Only create the real client if not in dry-run mode
-        self._client: Anthropic | None = None
-        if not self.dry_run:
-            self._client = Anthropic(api_key=settings.anthropic_api_key)
-            logger.info("llm_client_initialised", mode="live", models=[
-                f"{tier.value}: {cfg.model_id}" for tier, cfg in MODEL_REGISTRY.items()
-            ])
+    def __post_init__(self):
+        if self.api_key and not self.dry_run:
+            self._client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+            logger.info(
+                "Qwen client initialized",
+                extra={"base_url": self.base_url},
+            )
         else:
-            logger.info("llm_client_initialised", mode="dry_run")
+            logger.info("LLM client running in DRY-RUN mode (no API calls)")
 
-    def call(
+    def complete(
         self,
         prompt: str,
         tier: ModelTier = ModelTier.STANDARD,
-        system: str = "",
-        max_tokens: int | None = None,
-        temperature: float = 0.0,
-    ) -> LLMResult:
+        system_prompt: str = "",
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
         """
-        Make an LLM call with automatic model routing and cost tracking.
+        Send a prompt to the specified model tier and return a
+        standardised LLMResponse.
 
-        Args:
-            prompt: The user message to send to the model.
-            tier: Which model tier to use (FAST, STANDARD, ADVANCED).
-            system: Optional system prompt that sets the model's behaviour.
-            max_tokens: Maximum output tokens. If None, uses the tier's default.
-            temperature: Sampling temperature. 0.0 = deterministic (best for scoring).
-                         Higher values (0.3–0.7) add creativity (useful for drafting).
-
-        Returns:
-            LLMResult with the response text, token counts, cost, and latency.
+        In dry-run mode, returns a mock response with deterministic
+        token counts for testing.
         """
-        config = MODEL_REGISTRY[tier]
-        max_tokens = max_tokens or config.default_max_tokens
+        model = tier.value
+        start_time = time.time()
 
         if self.dry_run:
-            return self._mock_call(tier, config)
+            return self._mock_response(prompt, model, start_time)
 
-        return self._real_call(prompt, tier, config, system, max_tokens, temperature)
+        if self._client is None:
+            raise RuntimeError(
+                "LLM client not initialized. Provide a valid "
+                "DASHSCOPE_API_KEY or set DRY_RUN=true."
+            )
 
-    def _real_call(
-        self,
-        prompt: str,
-        tier: ModelTier,
-        config: ModelConfig,
-        system: str,
-        max_tokens: int,
-        temperature: float,
-    ) -> LLMResult:
-        """Make a real API call to Anthropic."""
-        assert self._client is not None, "Client not initialised — are you in dry_run mode?"
+        # Build messages list (system prompt goes as first message)
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
 
-        start_time = time.monotonic()
-
-        # Build the API request
-        kwargs: dict = {
-            "model": config.model_id,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        # Add system prompt if provided
-        if system:
-            kwargs["system"] = system
-
-        # Make the call
+        # Call Qwen via OpenAI-compatible API
         try:
-            response = self._client.messages.create(**kwargs)
+            response = self._client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         except Exception as e:
-            latency_ms = int((time.monotonic() - start_time) * 1000)
             logger.error(
-                "llm_call_failed",
-                tier=tier.value,
-                model=config.model_id,
-                error=str(e),
-                latency_ms=latency_ms,
+                "Qwen API call failed",
+                extra={"model": model, "error": str(e)},
             )
             raise
 
-        latency_ms = int((time.monotonic() - start_time) * 1000)
+        # Parse response (OpenAI format)
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        usage = response.usage
 
-        # Extract the text response
-        text = response.content[0].text if response.content else ""
+        input_tokens = usage.prompt_tokens if usage else 0
+        output_tokens = usage.completion_tokens if usage else 0
+        cost = self._calculate_cost(model, input_tokens, output_tokens)
+        latency_ms = (time.time() - start_time) * 1000
 
-        # Get token counts from the API response
-        tokens_input = response.usage.input_tokens
-        tokens_output = response.usage.output_tokens
+        # Accumulate totals
+        self.total_cost_usd += cost
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.call_count += 1
 
-        # Calculate cost
-        cost = calculate_cost(config, tokens_input, tokens_output)
-
-        # Update cumulative tracking
-        self._total_cost += cost
-        self._total_calls += 1
-
-        # Log the call
-        logger.info(
-            "llm_call_complete",
-            tier=tier.value,
-            model=config.model_id,
-            tokens_in=tokens_input,
-            tokens_out=tokens_output,
-            cost_usd=f"${cost:.6f}",
-            latency_ms=latency_ms,
-            cumulative_cost=f"${self._total_cost:.4f}",
-        )
-
-        return LLMResult(
-            text=text,
-            model_id=config.model_id,
-            model_tier=tier,
-            tokens_input=tokens_input,
-            tokens_output=tokens_output,
+        llm_usage = LLMUsage(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             cost_usd=cost,
             latency_ms=latency_ms,
-            is_mock=False,
         )
-
-    def _mock_call(
-        self,
-        tier: ModelTier,
-        config: ModelConfig,
-    ) -> LLMResult:
-        """Return a mock response for dry-run mode."""
-        # Simulate realistic token counts
-        mock_token_counts = {
-            ModelTier.FAST: (150, 80),       # Short classification calls
-            ModelTier.STANDARD: (500, 400),  # Medium drafting calls
-            ModelTier.ADVANCED: (800, 600),  # Longer compliance analysis
-        }
-
-        tokens_input, tokens_output = mock_token_counts[tier]
-        cost = calculate_cost(config, tokens_input, tokens_output)
-
-        self._total_cost += cost
-        self._total_calls += 1
 
         logger.info(
-            "llm_mock_call",
-            tier=tier.value,
-            model=config.model_id,
-            tokens_in=tokens_input,
-            tokens_out=tokens_output,
-            cost_usd=f"${cost:.6f}",
+            "LLM call complete",
+            extra={
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": f"${cost:.6f}",
+                "latency_ms": f"{latency_ms:.0f}",
+            },
         )
 
-        return LLMResult(
-            text=MOCK_RESPONSES[tier],
-            model_id=config.model_id,
-            model_tier=tier,
-            tokens_input=tokens_input,
-            tokens_output=tokens_output,
-            cost_usd=cost,
-            latency_ms=50,  # Simulated latency
-            is_mock=True,
+        return LLMResponse(
+            content=content,
+            usage=llm_usage,
+            model=model,
+            stop_reason=choice.finish_reason,
         )
 
-    @property
-    def total_cost(self) -> float:
-        """Total cost of all calls in this session (USD)."""
-        return self._total_cost
+    def _mock_response(
+        self, prompt: str, model: str, start_time: float
+    ) -> LLMResponse:
+        """
+        Return a deterministic mock response for dry-run testing.
+        Mimics realistic token counts and cost calculations.
+        """
+        input_tokens = max(len(prompt) // 4, 10)
+        output_tokens = 150
 
-    @property
-    def total_calls(self) -> int:
-        """Total number of calls made in this session."""
-        return self._total_calls
+        mock_content = (
+            f"[DRY-RUN: {model}] This is a mock response. "
+            f"In production, {model} would process your "
+            f"{input_tokens}-token prompt and generate a real response. "
+            f"The tender agent is working correctly in test mode."
+        )
+
+        cost = self._calculate_cost(model, input_tokens, output_tokens)
+        latency_ms = (time.time() - start_time) * 1000
+
+        self.total_cost_usd += cost
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.call_count += 1
+
+        return LLMResponse(
+            content=mock_content,
+            usage=LLMUsage(
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost,
+                latency_ms=latency_ms,
+            ),
+            model=model,
+            stop_reason="stop",
+        )
+
+    @staticmethod
+    def _calculate_cost(
+        model: str, input_tokens: int, output_tokens: int
+    ) -> float:
+        """Calculate USD cost based on Qwen per-million-token pricing."""
+        costs = MODEL_COSTS.get(model, {"input": 0.0, "output": 0.0})
+        return (
+            (input_tokens / 1_000_000) * costs["input"]
+            + (output_tokens / 1_000_000) * costs["output"]
+        )
 
     def get_cost_summary(self) -> dict:
-        """
-        Returns a summary of costs for the current session.
-        Useful for the audit log and cost tracking dashboard.
-        """
+        """Return accumulated cost and usage statistics."""
         return {
-            "total_calls": self._total_calls,
-            "total_cost_usd": round(self._total_cost, 6),
-            "models_available": {
-                tier.value: config.model_id
-                for tier, config in MODEL_REGISTRY.items()
-            },
-            "mode": "dry_run" if self.dry_run else "live",
+            "total_cost_usd": round(self.total_cost_usd, 6),
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "call_count": self.call_count,
         }
 
 
-# =============================================================================
-# SINGLETON INSTANCE
-# =============================================================================
-# Import this everywhere: from src.utils.llm_client import llm_client
-# It uses the DRY_RUN setting from .env automatically.
-
+# Singleton instance — import this everywhere:
+# from src.utils.llm_client import llm_client, ModelTier
 llm_client = MultiModelClient()

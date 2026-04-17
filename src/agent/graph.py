@@ -48,6 +48,7 @@ from src.agent.nodes.evaluate import evaluate_node as evaluate_node
 from src.agent.nodes.retrieve_draft import retrieve_draft_node as retrieve_draft_node
 from src.agent.nodes.gap_check import gap_check_node as gap_check_node
 from src.agent.nodes.slack_escalate import slack_escalate_node as slack_escalate_node
+from src.agent.nodes.assemble import assemble_node as assemble_node
 
 logger = structlog.get_logger(__name__)
 
@@ -92,33 +93,6 @@ def _audit(node: str, action: str, detail: str) -> dict:
 
 
 
-
-def assemble_node(state: TenderState) -> dict:
-    """Node 6: ASSEMBLE — Generate final submission document.
-
-    PLACEHOLDER: Returns mock success. Real implementation (Step 19) will:
-    - Select the correct template (DOCX/PDF) based on tender requirements
-    - Insert drafted sections into template with proper formatting
-    - Generate table of contents, page numbers, headers/footers
-    - Run quality checks: page limits, section ordering, attachments
-    - Retry up to 3 times on quality failures
-    - Save final document to filesystem and S3
-    """
-    logger.info("node_assemble", tender_id=state.get("tender_id", "unknown"))
-
-    retry_count = state.get("assembly_retry_count", 0)
-
-    return {
-        "assembled_document_path": "/tmp/tender_response_mock.pdf",
-        "quality_check_passed": True,
-        "quality_issues": [],
-        "assembly_retry_count": retry_count,
-        "status": TenderStatus.ASSEMBLING.value,
-        "current_node": "assemble",
-        "audit_log": [_audit("assemble", "document_assembled", (
-            "Document assembled and quality checks passed."
-        ))],
-    }
 
 
 def submit_node(state: TenderState) -> dict:

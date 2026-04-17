@@ -49,6 +49,7 @@ from src.agent.nodes.retrieve_draft import retrieve_draft_node as retrieve_draft
 from src.agent.nodes.gap_check import gap_check_node as gap_check_node
 from src.agent.nodes.slack_escalate import slack_escalate_node as slack_escalate_node
 from src.agent.nodes.assemble import assemble_node as assemble_node
+from src.agent.nodes.submit import submit_node as submit_node
 
 logger = structlog.get_logger(__name__)
 
@@ -94,30 +95,6 @@ def _audit(node: str, action: str, detail: str) -> dict:
 
 
 
-
-def submit_node(state: TenderState) -> dict:
-    """Node 7: SUBMIT — Dispatch the tender to the procurement portal.
-
-    PLACEHOLDER: Returns mock success. Real implementation (Step 22) will:
-    - Determine submission method (portal upload, email, API)
-    - Playwright automation for portal uploads (fill forms, upload files)
-    - SMTP for email submissions
-    - Capture confirmation screenshot and receipt
-    - Handle submission failures with retry logic
-    """
-    logger.info("node_submit", tender_id=state.get("tender_id", "unknown"))
-
-    return {
-        "submission_method": "portal_upload",
-        "submission_status": "success",
-        "submission_confirmation": "MOCK-RECEIPT-001",
-        "submission_screenshot_path": "/tmp/submission_screenshot_mock.png",
-        "status": TenderStatus.SUBMITTED.value,
-        "current_node": "submit",
-        "audit_log": [_audit("submit", "tender_submitted", (
-            f"Tender submitted via portal_upload. Receipt: MOCK-RECEIPT-001."
-        ))],
-    }
 
 
 # ---------------------------------------------------------------------------

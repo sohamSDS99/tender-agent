@@ -5,9 +5,9 @@ Replaces the Anthropic-based client. Uses the openai SDK pointed
 at Alibaba Cloud's DashScope endpoint.
 
 Model tiers:
-  FAST     -> qwen3.5-flash   (scoring, classification)
-  STANDARD -> qwen3.5-plus    (section drafting, RAG Q&A)
-  ADVANCED -> qwen3-max       (compliance reasoning)
+  FAST     -> qwen/qwen3.5-flash-02-23   (scoring, classification)
+  STANDARD -> qwen/qwen3.5-plus-02-15    (section drafting, RAG Q&A)
+  ADVANCED -> qwen/qwen3-max       (compliance reasoning)
 """
 
 from __future__ import annotations
@@ -25,16 +25,16 @@ logger = logging.getLogger(__name__)
 
 class ModelTier(str, Enum):
     """Maps business purpose to a specific Qwen model."""
-    FAST = "qwen3.5-flash"
-    STANDARD = "qwen3.5-plus"
-    ADVANCED = "qwen3-max"
+    FAST = "qwen/qwen3.5-flash-02-23"
+    STANDARD = "qwen/qwen3.5-plus-02-15"
+    ADVANCED = "qwen/qwen3-max"
 
 
 # Cost per 1M tokens (USD)
 MODEL_COSTS = {
-    "qwen3.5-flash":  {"input": 0.07,  "output": 0.26},
-    "qwen3.5-plus":   {"input": 0.26,  "output": 1.56},
-    "qwen3-max":      {"input": 0.78,  "output": 3.90},
+    "qwen/qwen3.5-flash-02-23":  {"input": 0.07,  "output": 0.26},
+    "qwen/qwen3.5-plus-02-15":   {"input": 0.26,  "output": 1.56},
+    "qwen/qwen3-max":      {"input": 0.78,  "output": 3.90},
 }
 
 

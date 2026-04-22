@@ -66,10 +66,21 @@ class TimestampMixin:
 
 # --- Database Engine & Session ---
 
+# Supabase (and any hosted PostgreSQL) requires SSL and has connection limits.
+# Free tier: 60 connections max. pool_size + max_overflow must stay well under that.
+_connect_args: dict = {}
+if "supabase.co" in settings.database_url:
+    _connect_args["sslmode"] = "require"
+
 engine = create_engine(
     settings.database_url,
-    pool_pre_ping=True,
-    echo=False,  # Set to True to see all SQL queries in the console (noisy but useful for debugging)
+    pool_pre_ping=True,   # Verify connections are alive before checkout
+    pool_size=5,          # Base connections kept open
+    max_overflow=10,      # Extra connections allowed under load
+    pool_timeout=30,      # Seconds to wait for a connection from the pool
+    pool_recycle=1800,    # Recycle connections every 30 min (avoids stale connections)
+    connect_args=_connect_args,
+    echo=False,  # Set to True to see all SQL queries in the console
 )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)

@@ -59,25 +59,17 @@ class Settings:
     # --- Voyage AI ---
     voyage_api_key: str = field(default_factory=lambda: _require_env("VOYAGE_API_KEY"))
 
-    # --- Database ---
+    # --- Database (Supabase) ---
     database_url: str = field(
         default_factory=lambda: _require_env("DATABASE_URL")
     )
+    supabase_url: str = field(default_factory=lambda: _optional_env("SUPABASE_URL"))
+    supabase_anon_key: str = field(default_factory=lambda: _optional_env("SUPABASE_ANON_KEY"))
 
     # --- Slack ---
     slack_bot_token: str = field(default_factory=lambda: _optional_env("SLACK_BOT_TOKEN"))
     slack_app_token: str = field(default_factory=lambda: _optional_env("SLACK_APP_TOKEN"))
     slack_channel_id: str = field(default_factory=lambda: _optional_env("SLACK_CHANNEL_ID"))
-
-    # --- AWS ---
-    aws_access_key_id: str = field(default_factory=lambda: _optional_env("AWS_ACCESS_KEY_ID"))
-    aws_secret_access_key: str = field(
-        default_factory=lambda: _optional_env("AWS_SECRET_ACCESS_KEY")
-    )
-    aws_region: str = field(default_factory=lambda: _optional_env("AWS_REGION", "us-east-1"))
-    s3_bucket_name: str = field(
-        default_factory=lambda: _optional_env("S3_BUCKET_NAME", "tender-agent-docs")
-    )
 
     # --- Email ---
     imap_server: str = field(default_factory=lambda: _optional_env("IMAP_SERVER"))

@@ -38,6 +38,20 @@ from nexus_sdk import NexusClient, AgentConfig
 # Import tender-agent's discovery modules
 from src.discovery.sam_gov import SamGovScraper, score_relevance
 from src.discovery.serp_search import SerpTenderSearcher, get_excluded_domains_for_region
+from src.discovery.ted_europa import TedEuropaSearcher
+from src.discovery.uk_tenders import UkTenderSearcher
+from src.discovery.boamp_france import BoampSearcher
+from src.discovery.world_bank import WorldBankSearcher
+from src.discovery.prozorro import ProzorroSearcher
+from src.discovery.canada_buys import CanadaBuysSearcher
+from src.discovery.austender import AusTenderSearcher
+from src.discovery.sa_etender import SaEtenderSearcher
+from src.discovery.colombia_secop import ColombiaSecopSearcher
+from src.discovery.brazil_compras import BrazilComprasSearcher
+from src.discovery.germany_bkms import GermanyBkmsSearcher
+from src.discovery.italy_anac import ItalyAnacSearcher
+from src.discovery.dominican_dgcp import DominicanDgcpSearcher
+from src.discovery.peru_oece import PeruOeceSearcher
 
 # Import form processing modules
 from src.forms.form_parser import FormParser
@@ -470,21 +484,36 @@ TENDER_URL_PATTERNS = [
     "/contract/", "/award/", "/announcement/",
 ]
 
-# URL patterns that indicate NOT a tender (info pages, wikis, articles)
+# URL patterns that indicate NOT a tender (info pages, wikis, articles, news)
 NOT_TENDER_PATTERNS = [
     "/legislation/", "/directives/", "/guidelines/", "/themes/",
-    "/wiki/", "/blog/", "/article/", "/news/", "/about/",
-    "/glossary/", "/eguides/", "/films/", "/tools/", "/resources/",
-    "/faq/", "/help/", "/contact/", "/policy/", "/regulation/",
-    "/publications/", "/research/", "/reports/", "/events/",
+    "/wiki/", "/blog/", "/article/", "/articles/", "/news/",
+    "/about/", "/glossary/", "/eguides/", "/films/", "/tools/",
+    "/resources/", "/faq/", "/help/", "/contact/", "/policy/",
+    "/regulation/", "/publications/", "/research/", "/reports/",
+    "/events/", "/magazine/", "/webinar/", "/training/", "/podcast/",
+    "/case-study/", "/case-studies/", "/white-paper/", "/whitepapers/",
+    "/product/", "/products/", "/pricing/", "/demo/", "/solutions/",
+    "/press-release/", "/press/", "/media/", "/insights/",
+    "/category/", "/tag/", "/author/",
 ]
 
-# Domains to always exclude
+# Domains to always exclude — social, news, SaaS marketing, and industry
+# magazines that will never contain actual tender listings
 EXCLUDE_DOMAINS = {
+    # Social media
     "linkedin.com", "youtube.com", "facebook.com", "twitter.com",
-    "reddit.com", "medium.com", "wikipedia.org", "quora.com",
-    "heyiris.ai", "hubspot.com", "salesforce.com", "oshwiki.osha.europa.eu",
-    "eguides.osha.europa.eu",
+    "reddit.com", "quora.com", "instagram.com", "tiktok.com",
+    # Content platforms
+    "medium.com", "wikipedia.org", "slideshare.net",
+    # Industry news & magazines (articles ABOUT safety, not tenders)
+    "ohsonline.com", "ehstoday.com", "ishn.com", "safetyandhealthmagazine.com",
+    "chemicalwatch.com", "chemweek.com", "chemicalprocessing.com",
+    # SaaS / marketing sites
+    "heyiris.ai", "hubspot.com", "salesforce.com", "g2.com",
+    "capterra.com", "gartner.com", "softwareadvice.com",
+    # OSHA info pages (not procurement)
+    "oshwiki.osha.europa.eu", "eguides.osha.europa.eu",
 }
 
 # Domains where ONLY specific paths are tenders
@@ -495,134 +524,584 @@ STRICT_PATH_DOMAINS = {
 
 
 def is_valid_tender_link(url: str) -> bool:
-    """Check if a URL is an actual tender listing page."""
+    """Check if a URL is likely a tender/procurement page.
+
+    Uses a blocklist approach: block known-bad domains and non-tender URL
+    patterns, but allow everything else through.  Quality control is handled
+    downstream by relevance scoring and deadline classification.
+    """
     from urllib.parse import urlparse
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower().replace("www.", "")
         path = parsed.path.lower()
 
-        # Always exclude known non-tender sites
+        # Block 1: Known non-tender sites (social media, wikis, etc.)
         for excluded in EXCLUDE_DOMAINS:
             if excluded in domain:
                 return False
 
-        # Exclude info/wiki/legislation pages
+        # Block 2: Info/wiki/legislation pages on otherwise-OK domains
         for pattern in NOT_TENDER_PATTERNS:
             if pattern in path:
                 return False
 
-        # Strict path domains — only allow specific paths
+        # Block 3: Strict-path domains — only specific paths are tenders
         for strict_domain, allowed_paths in STRICT_PATH_DOMAINS.items():
             if strict_domain in domain:
                 return any(ap in path for ap in allowed_paths)
 
-        # Known tender portals with any path are OK
-        trusted_portals = {
-            "sam.gov", "ted.europa.eu", "ungm.org", "merx.com",
-            "bidnetdirect.com", "virginiabids.com", "highergov.com",
-            "tendersontime.com", "buyandsell.gc.ca", "bidsandtenders.ca",
-            "tenders.gov.au", "eprocure.gov.in", "etenders.gov.za",
-            "globaltenders.com", "dgmarket.com", "devbusiness.com",
-            "contracts.gov.sg", "etimaden.gov.tr",
-        }
-        for portal in trusted_portals:
-            if portal in domain:
-                return True
-
-        # Check URL path for tender-like patterns
-        for pattern in TENDER_URL_PATTERNS:
-            if pattern in path:
-                return True
-
-        return False
+        # Everything else is allowed — relevance scoring + deadline
+        # classification handle quality control downstream
+        return True
     except Exception:
         return False
 
 
-def run_tender_search(query: str) -> tuple[str, dict]:
-    """Run a global tender discovery search via Bright Data SERP proxy.
+def _filter_serp_leads(leads: list, query: str) -> list:
+    """Run the 7-gate filtering pipeline on SERP results.
 
-    Returns only verified tender links with clean formatting.
+    This is ONLY used in deep search mode. API results skip this entirely.
+
+    Gates:
+      1. Block known-bad URLs (blocklist)
+      2. Block wrong region
+      3. Require strong SDS/EHS keyword match
+      4. Reject empty portal pages
+      5. Require tender signal (proof it's procurement, not news)
+      6. Minimum relevance score
+      7. Deadline/freshness (expired/stale → block)
     """
-    start_time = time.perf_counter()
-
-    # Step 1: Search globally via SERP proxy
-    _audit(
-        "tool_call",
-        f"Starting SERP search for: {query[:100]}",
-        node_name="discover",
-        input_payload={"query": query, "tool": "brightdata_serp"},
-    )
-    try:
-        searcher = SerpTenderSearcher()
-        leads = searcher.search(user_query=query)
-        _audit(
-            "tool_call",
-            f"SERP search returned {len(leads)} raw leads",
-            node_name="discover",
-            status="success",
-            output_payload={"raw_leads_count": len(leads)},
-        )
-    except Exception as exc:
-        _audit(
-            "tool_call",
-            f"SERP search failed: {exc}",
-            node_name="discover",
-            status="failure",
-            error_message=str(exc),
-        )
-        print(f"SERP search failed: {exc}, falling back to SAM.gov dry run")
-        scraper = SamGovScraper(dry_run=True)
-        raw = scraper.fetch_opportunities(days_back=7)
-        leads = [
-            type('Lead', (), {
-                'title': l.title, 'description': l.description,
-                'agency': l.agency, 'source_url': l.source_url,
-                'relevance_score': l.relevance_score,
-                'relevance_keywords': l.relevance_keywords,
-                'submission_deadline': l.submission_deadline,
-            })()
-            for l in raw
-        ]
-
-    # Step 2: Filter — only real tender links + exclude expired + exclude wrong region
     from dateutil import parser as dateparser
     from urllib.parse import urlparse
+    from src.discovery.serp_search import extract_deadline_from_text
 
     today = datetime.now(timezone.utc).date()
     excluded_domains = get_excluded_domains_for_region(query)
-    print(f"  Region filter: excluding {excluded_domains if excluded_domains else 'none (global search)'}")
 
-    def is_not_expired(lead: object) -> bool:
+    MIN_RELEVANCE = 0.15
+    NO_DEADLINE_SORT_PENALTY = 0.85
+    STALENESS_THRESHOLD_DAYS = 120
+
+    def classify_deadline(lead: object) -> str:
         deadline = getattr(lead, 'submission_deadline', '') or ''
         if not deadline or len(deadline) < 8:
-            return True
-        try:
-            parsed_date = dateparser.parse(deadline).date()
-            return parsed_date >= today
-        except Exception:
-            return True
+            desc = getattr(lead, 'description', '') or ''
+            title = getattr(lead, 'title', '') or ''
+            deadline = extract_deadline_from_text(f"{title} {desc}")
+        if deadline and len(deadline) >= 8:
+            try:
+                parsed_date = dateparser.parse(deadline).date()
+                return 'valid' if parsed_date >= today else 'expired'
+            except Exception:
+                pass
+        posted = getattr(lead, 'posted_date', '') or ''
+        if posted and len(posted) >= 8:
+            try:
+                posted_parsed = dateparser.parse(posted).date()
+                age_days = (today - posted_parsed).days
+                if age_days > STALENESS_THRESHOLD_DAYS:
+                    return 'stale'
+            except Exception:
+                pass
+        return 'missing'
 
     def is_correct_region(lead: object) -> bool:
         if not excluded_domains:
             return True
         try:
             domain = urlparse(lead.source_url).netloc.lower().replace("www.", "")
-            for excluded in excluded_domains:
-                if excluded in domain:
-                    return False
-            return True
+            return not any(exc in domain for exc in excluded_domains)
         except Exception:
             return True
 
-    valid_leads = [
-        l for l in leads
-        if is_valid_tender_link(l.source_url)
-        and is_not_expired(l)
-        and is_correct_region(l)
-        and l.relevance_score >= 0.20  # Minimum 20% relevance — skip junk results
+    valid = []
+    counts = {
+        "blocked_url": 0, "blocked_region": 0, "no_strong_kw": 0,
+        "empty_page": 0, "no_tender_signal": 0,
+        "low_relevance": 0, "expired": 0, "stale": 0, "undated": 0,
+    }
+
+    for lead in leads:
+        raw = getattr(lead, 'raw_data', {}) or {}
+
+        if not is_valid_tender_link(lead.source_url):
+            counts["blocked_url"] += 1
+            continue
+        if not is_correct_region(lead):
+            counts["blocked_region"] += 1
+            continue
+        if not raw.get("has_strong_match", False):
+            counts["no_strong_kw"] += 1
+            continue
+        if raw.get("is_empty_page", False):
+            counts["empty_page"] += 1
+            continue
+        if not raw.get("has_tender_signal", False):
+            counts["no_tender_signal"] += 1
+            continue
+        if lead.relevance_score < MIN_RELEVANCE:
+            counts["low_relevance"] += 1
+            continue
+
+        deadline_status = classify_deadline(lead)
+        if deadline_status == 'expired':
+            counts["expired"] += 1
+            continue
+        if deadline_status == 'stale':
+            counts["stale"] += 1
+            continue
+
+        if deadline_status == 'missing':
+            counts["undated"] += 1
+            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
+        else:
+            lead._effective_score = lead.relevance_score
+
+        valid.append(lead)
+
+    valid.sort(key=lambda l: getattr(l, '_effective_score', l.relevance_score), reverse=True)
+
+    print(f"    Pipeline: {len(valid)} passed out of {len(leads)}")
+    print(f"    blocked-url={counts['blocked_url']} | region={counts['blocked_region']} | "
+          f"no-kw={counts['no_strong_kw']} | empty={counts['empty_page']} | "
+          f"not-tender={counts['no_tender_signal']} | low-rel={counts['low_relevance']} | "
+          f"expired={counts['expired']} | stale={counts['stale']} | undated={counts['undated']}")
+
+    return valid
+
+
+def _is_deep_search(query: str) -> bool:
+    """Detect if the user wants a deep/extended search (triggers SERP).
+
+    Normal queries hit direct APIs only. Deep search adds Google SERP
+    for broader coverage of smaller portals that don't have APIs.
+    """
+    deep_triggers = [
+        "deep search", "deep-search", "extended search", "broad search",
+        "search everywhere", "all sources", "include google",
+        "serp", "google search", "wider search",
     ]
+    q_lower = query.lower()
+    return any(trigger in q_lower for trigger in deep_triggers)
+
+
+def _strip_deep_trigger(query: str) -> str:
+    """Remove the deep search trigger phrase from the query."""
+    import re
+    triggers = [
+        r"deep[\s-]?search\s*", r"extended\s+search\s*", r"broad\s+search\s*",
+        r"search\s+everywhere\s*", r"all\s+sources\s*", r"include\s+google\s*",
+        r"serp\s*", r"google\s+search\s*", r"wider\s+search\s*",
+    ]
+    cleaned = query
+    for trigger in triggers:
+        cleaned = re.sub(trigger, "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def run_tender_search(query: str) -> tuple[str, dict]:
+    """Run tender discovery using direct government APIs.
+
+    Architecture (permanent — production-ready):
+      DEFAULT MODE (API-only):
+        1. TED Europa API — active EU procurement notices
+        2. UK Contracts Finder + Find a Tender — UK government tenders
+        3. SAM.gov API — US federal opportunities (when API key is set)
+        All return structured data with verified deadlines. No filtering needed.
+
+      DEEP SEARCH MODE (opt-in, user says "deep search ..."):
+        Adds Google SERP via Bright Data as a supplementary source.
+        SERP results go through the 7-gate filtering pipeline.
+
+    This is NOT a band-aid. Direct APIs guarantee:
+      - Only active, non-expired tenders (API-level filtering)
+      - Real deadline dates from the source of truth
+      - Proper agency/buyer names
+      - No news articles, blog posts, or empty portal pages
+    """
+    start_time = time.perf_counter()
+    from src.discovery.serp_search import detect_region
+
+    # Check if user wants deep search (opt-in SERP)
+    deep_search = _is_deep_search(query)
+    search_query = _strip_deep_trigger(query) if deep_search else query
+
+    detected_region = detect_region(search_query)
+    mode_label = "DEEP SEARCH (API + SERP)" if deep_search else "API-ONLY"
+
+    print(f"\n{'='*60}")
+    print(f"  Tender search: '{search_query[:80]}'")
+    print(f"  Region: {detected_region} | Mode: {mode_label}")
+    print(f"{'='*60}")
+
+    # ------------------------------------------------------------------
+    # Step 1: Direct API sources (structured, reliable, ALWAYS run)
+    # ------------------------------------------------------------------
+    api_leads: list = []
+
+    # TED Europa — for Europe queries (or global)
+    if detected_region in ("europe", "uk", "global"):
+        try:
+            print("  [TED API] Querying TED Europa for active EU tenders...")
+            ted_searcher = TedEuropaSearcher()
+            ted_leads = ted_searcher.search(user_query=search_query, max_results=15)
+            api_leads.extend(ted_leads)
+            print(f"  [TED API] Got {len(ted_leads)} structured results")
+            _audit(
+                "tool_call",
+                f"TED Europa API returned {len(ted_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "ted_europa", "count": len(ted_leads)},
+            )
+        except Exception as exc:
+            print(f"  [TED API] Failed: {exc}")
+            _audit(
+                "tool_call", f"TED Europa API failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+
+    # UK Contracts Finder + Find a Tender — for UK queries (or global/europe)
+    if detected_region in ("uk", "europe", "global"):
+        try:
+            print("  [UK API] Querying Contracts Finder + Find a Tender...")
+            uk_searcher = UkTenderSearcher()
+            uk_leads = uk_searcher.search(user_query=search_query, max_results=15, days_back=60)
+            api_leads.extend(uk_leads)
+            print(f"  [UK API] Got {len(uk_leads)} relevant UK tenders")
+            _audit(
+                "tool_call",
+                f"UK Tenders API returned {len(uk_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "uk_gov", "count": len(uk_leads)},
+            )
+        except Exception as exc:
+            print(f"  [UK API] Failed: {exc}")
+            _audit(
+                "tool_call", f"UK Tenders API failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+
+    # SAM.gov — for US queries (if API key available)
+    sam_api_key = os.getenv("SAM_GOV_API_KEY", "")
+    if detected_region in ("usa", "global") and sam_api_key:
+        try:
+            print("  [SAM API] Querying SAM.gov for active US tenders...")
+            sam_scraper = SamGovScraper(dry_run=False)
+            sam_leads = sam_scraper.fetch_opportunities(days_back=30)
+            api_leads.extend(sam_leads)
+            print(f"  [SAM API] Got {len(sam_leads)} structured results")
+            _audit(
+                "tool_call",
+                f"SAM.gov API returned {len(sam_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "sam_gov", "count": len(sam_leads)},
+            )
+        except Exception as exc:
+            print(f"  [SAM API] Failed: {exc}")
+    elif detected_region in ("usa", "global") and not sam_api_key:
+        print("  [SAM API] Skipped — SAM_GOV_API_KEY not set (register at sam.gov)")
+
+    # BOAMP (France) — for Europe/France queries (or global)
+    if detected_region in ("europe", "global"):
+        try:
+            print("  [BOAMP API] Querying French BOAMP for active tenders...")
+            boamp_searcher = BoampSearcher()
+            boamp_leads = boamp_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(boamp_leads)
+            print(f"  [BOAMP API] Got {len(boamp_leads)} relevant French tenders")
+            _audit(
+                "tool_call",
+                f"BOAMP API returned {len(boamp_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "boamp", "count": len(boamp_leads)},
+            )
+        except Exception as exc:
+            print(f"  [BOAMP API] Failed: {exc}")
+            _audit(
+                "tool_call", f"BOAMP API failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+
+    # World Bank Procurement — for global and non-Western-market queries
+    if detected_region in ("global", "india", "australia"):
+        try:
+            print("  [World Bank API] Querying World Bank procurement notices...")
+            wb_searcher = WorldBankSearcher()
+            wb_leads = wb_searcher.search(user_query=search_query, max_results=10, days_back=90)
+            api_leads.extend(wb_leads)
+            print(f"  [World Bank API] Got {len(wb_leads)} relevant tenders")
+            _audit(
+                "tool_call",
+                f"World Bank API returned {len(wb_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "world_bank", "count": len(wb_leads)},
+            )
+        except Exception as exc:
+            print(f"  [World Bank API] Failed: {exc}")
+            _audit(
+                "tool_call", f"World Bank API failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+
+    # Prozorro (Ukraine) — for Europe/global queries
+    if detected_region in ("europe", "global"):
+        try:
+            print("  [Prozorro API] Querying Ukrainian Prozorro for active tenders...")
+            prozorro_searcher = ProzorroSearcher()
+            prozorro_leads = prozorro_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(prozorro_leads)
+            print(f"  [Prozorro API] Got {len(prozorro_leads)} relevant Ukrainian tenders")
+            _audit(
+                "tool_call",
+                f"Prozorro API returned {len(prozorro_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "prozorro", "count": len(prozorro_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Prozorro API] Failed: {exc}")
+            _audit(
+                "tool_call", f"Prozorro API failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+
+    # CanadaBuys — for Canada/North America/global queries
+    if detected_region in ("canada", "usa", "global"):
+        try:
+            print("  [CanadaBuys API] Querying Canadian procurement data...")
+            canada_searcher = CanadaBuysSearcher()
+            canada_leads = canada_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(canada_leads)
+            print(f"  [CanadaBuys API] Got {len(canada_leads)} relevant Canadian tenders")
+            _audit(
+                "tool_call",
+                f"CanadaBuys API returned {len(canada_leads)} leads",
+                node_name="discover",
+                status="success",
+                output_payload={"source": "canada_buys", "count": len(canada_leads)},
+            )
+        except Exception as exc:
+            print(f"  [CanadaBuys API] Failed: {exc}")
+            _audit(
+                "tool_call", f"CanadaBuys API failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+
+    # AusTender (Australia) — for Australia/global queries
+    if detected_region in ("australia", "global"):
+        try:
+            print("  [AusTender API] Querying Australian federal tenders...")
+            aus_searcher = AusTenderSearcher()
+            aus_leads = aus_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(aus_leads)
+            print(f"  [AusTender API] Got {len(aus_leads)} relevant Australian tenders")
+            _audit(
+                "tool_call",
+                f"AusTender API returned {len(aus_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "austender", "count": len(aus_leads)},
+            )
+        except Exception as exc:
+            print(f"  [AusTender API] Failed: {exc}")
+            _audit("tool_call", f"AusTender API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # South Africa eTender — for Africa/global queries
+    if detected_region in ("africa", "global"):
+        try:
+            print("  [SA eTender API] Querying South African government tenders...")
+            sa_searcher = SaEtenderSearcher()
+            sa_leads = sa_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(sa_leads)
+            print(f"  [SA eTender API] Got {len(sa_leads)} relevant South African tenders")
+            _audit(
+                "tool_call",
+                f"SA eTender API returned {len(sa_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "sa_etender", "count": len(sa_leads)},
+            )
+        except Exception as exc:
+            print(f"  [SA eTender API] Failed: {exc}")
+            _audit("tool_call", f"SA eTender API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Colombia SECOP — for South America/global queries
+    if detected_region in ("south_america", "global"):
+        try:
+            print("  [Colombia SECOP API] Querying Colombian procurement data...")
+            col_searcher = ColombiaSecopSearcher()
+            col_leads = col_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(col_leads)
+            print(f"  [Colombia SECOP API] Got {len(col_leads)} relevant Colombian tenders")
+            _audit(
+                "tool_call",
+                f"Colombia SECOP API returned {len(col_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "colombia_secop", "count": len(col_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Colombia SECOP API] Failed: {exc}")
+            _audit("tool_call", f"Colombia SECOP API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Brazil Compras — for South America/global queries
+    if detected_region in ("south_america", "global"):
+        try:
+            print("  [Brazil Compras API] Querying Brazilian federal procurement...")
+            br_searcher = BrazilComprasSearcher()
+            br_leads = br_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(br_leads)
+            print(f"  [Brazil Compras API] Got {len(br_leads)} relevant Brazilian tenders")
+            _audit(
+                "tool_call",
+                f"Brazil Compras API returned {len(br_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "brazil_compras", "count": len(br_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Brazil Compras API] Failed: {exc}")
+            _audit("tool_call", f"Brazil Compras API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Germany BKMS — for Europe/global queries
+    if detected_region in ("europe", "global"):
+        try:
+            print("  [Germany BKMS API] Querying German federal procurement...")
+            de_searcher = GermanyBkmsSearcher()
+            de_leads = de_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(de_leads)
+            print(f"  [Germany BKMS API] Got {len(de_leads)} relevant German tenders")
+            _audit(
+                "tool_call",
+                f"Germany BKMS API returned {len(de_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "germany_bkms", "count": len(de_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Germany BKMS API] Failed: {exc}")
+            _audit("tool_call", f"Germany BKMS API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Italy ANAC — for Europe/global queries
+    if detected_region in ("europe", "global"):
+        try:
+            print("  [Italy ANAC API] Querying Italian public procurement...")
+            it_searcher = ItalyAnacSearcher()
+            it_leads = it_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(it_leads)
+            print(f"  [Italy ANAC API] Got {len(it_leads)} relevant Italian tenders")
+            _audit(
+                "tool_call",
+                f"Italy ANAC API returned {len(it_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "italy_anac", "count": len(it_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Italy ANAC API] Failed: {exc}")
+            _audit("tool_call", f"Italy ANAC API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Dominican Republic DGCP — for South America/Caribbean/global queries
+    if detected_region in ("south_america", "global"):
+        try:
+            print("  [Dominican DGCP API] Querying Dominican Republic procurement...")
+            dr_searcher = DominicanDgcpSearcher()
+            dr_leads = dr_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(dr_leads)
+            print(f"  [Dominican DGCP API] Got {len(dr_leads)} relevant Dominican tenders")
+            _audit(
+                "tool_call",
+                f"Dominican DGCP API returned {len(dr_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "dominican_dgcp", "count": len(dr_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Dominican DGCP API] Failed: {exc}")
+            _audit("tool_call", f"Dominican DGCP API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Peru OECE — for South America/global queries
+    if detected_region in ("south_america", "global"):
+        try:
+            print("  [Peru OECE API] Querying Peruvian procurement data...")
+            pe_searcher = PeruOeceSearcher()
+            pe_leads = pe_searcher.search(user_query=search_query, max_results=10, days_back=90)
+            api_leads.extend(pe_leads)
+            print(f"  [Peru OECE API] Got {len(pe_leads)} relevant Peruvian tenders")
+            _audit(
+                "tool_call",
+                f"Peru OECE API returned {len(pe_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "peru_oece", "count": len(pe_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Peru OECE API] Failed: {exc}")
+            _audit("tool_call", f"Peru OECE API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    print(f"  API total: {len(api_leads)} leads from direct government APIs")
+
+    # ------------------------------------------------------------------
+    # Step 2: SERP search (ONLY if deep search mode)
+    # ------------------------------------------------------------------
+    serp_valid_leads: list = []
+
+    if deep_search:
+        print("  [SERP] Deep search mode — running Google via Bright Data...")
+        _audit(
+            "tool_call",
+            f"Starting SERP deep search for: {search_query[:100]}",
+            node_name="discover",
+            input_payload={"query": search_query, "tool": "brightdata_serp", "mode": "deep_search"},
+        )
+        try:
+            searcher = SerpTenderSearcher()
+            serp_leads = searcher.search(user_query=search_query)
+            print(f"  [SERP] Got {len(serp_leads)} raw leads — running 7-gate pipeline...")
+
+            # Run the full 7-gate filtering pipeline on SERP results
+            serp_valid_leads = _filter_serp_leads(serp_leads, search_query)
+            print(f"  [SERP] {len(serp_valid_leads)} passed pipeline")
+
+        except Exception as exc:
+            print(f"  [SERP] Failed: {exc}")
+            _audit(
+                "tool_call", f"SERP search failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+    else:
+        print("  [SERP] Skipped — API-only mode (use 'deep search ...' to include Google)")
+
+    # ------------------------------------------------------------------
+    # Step 3: Merge & deduplicate
+    # ------------------------------------------------------------------
+    seen_urls: set[str] = set()
+    valid_leads: list = []
+
+    # API leads first (higher quality, structured data)
+    for lead in api_leads:
+        url = getattr(lead, 'source_url', '')
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            if not hasattr(lead, '_effective_score'):
+                lead._effective_score = getattr(lead, 'relevance_score', 0.80)
+            valid_leads.append(lead)
+
+    # Then SERP leads (if deep search was used)
+    for lead in serp_valid_leads:
+        url = getattr(lead, 'source_url', '')
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            valid_leads.append(lead)
+
+    valid_leads.sort(
+        key=lambda l: getattr(l, '_effective_score', getattr(l, 'relevance_score', 0)),
+        reverse=True,
+    )
+
+    _all_api_portals = ('ted.europa.eu', 'sam.gov', 'uk_gov', 'boamp', 'world_bank', 'prozorro', 'canada_buys', 'austender', 'sa_etender', 'colombia_secop', 'brazil_compras', 'germany_bkms', 'italy_anac', 'dominican_dgcp', 'peru_oece')
+    api_count = len([l for l in valid_leads if getattr(l, 'source_portal', '') in _all_api_portals])
+    serp_count = len(valid_leads) - api_count
+
+    print(f"  FINAL: {len(valid_leads)} total ({api_count} API + {serp_count} SERP)")
 
     if not valid_leads:
         from src.discovery.serp_search import detect_region, REGION_COUNTRY_NAMES
@@ -657,17 +1136,41 @@ def run_tender_search(query: str) -> tuple[str, dict]:
             "cost_usd": 0,
         }
 
-    # Step 3: Format each tender as a rich card
+    # Step 3: Format each tender as a rich card with source badges
     import re
+
+    # Source badge mapping — users see exactly where each tender came from
+    SOURCE_BADGES = {
+        "ted.europa.eu":   "\U0001f1ea\U0001f1fa TED Europa",
+        "uk_gov":          "\U0001f1ec\U0001f1e7 UK Gov",
+        "sam.gov":         "\U0001f1fa\U0001f1f8 SAM.gov",
+        "boamp":           "\U0001f1eb\U0001f1f7 BOAMP France",
+        "world_bank":      "\U0001f30d World Bank",
+        "prozorro":        "\U0001f1fa\U0001f1e6 Prozorro",
+        "canada_buys":     "\U0001f1e8\U0001f1e6 CanadaBuys",
+        "austender":       "\U0001f1e6\U0001f1fa AusTender",
+        "sa_etender":      "\U0001f1ff\U0001f1e6 SA eTender",
+        "colombia_secop":  "\U0001f1e8\U0001f1f4 SECOP Colombia",
+        "brazil_compras":  "\U0001f1e7\U0001f1f7 Compras Brazil",
+        "germany_bkms":    "\U0001f1e9\U0001f1ea BKMS Germany",
+        "italy_anac":      "\U0001f1ee\U0001f1f9 ANAC Italy",
+        "dominican_dgcp":  "\U0001f1e9\U0001f1f4 DGCP Dom. Rep.",
+        "peru_oece":       "\U0001f1f5\U0001f1ea OECE Peru",
+    }
+
     formatted_items = []
     for i, lead in enumerate(valid_leads[:10], 1):
         title = lead.title.strip()
         if len(title) > 80:
             title = title[:77] + "..."
         url = lead.source_url
-        source = getattr(lead, 'agency', 'Unknown')
+        agency = getattr(lead, 'agency', 'Unknown')
         relevance = lead.relevance_score
         deadline = getattr(lead, 'submission_deadline', '') or ''
+        portal = getattr(lead, 'source_portal', '')
+
+        # Source badge
+        source_badge = SOURCE_BADGES.get(portal, "\U0001f50d SERP")
 
         # Clean the description
         desc = getattr(lead, 'description', '') or ''
@@ -679,20 +1182,32 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         if len(desc) > 200:
             desc = desc[:197] + "..."
 
+        # Value (if available from UK or SAM APIs)
+        value_str = ""
+        value_amount = getattr(lead, 'value_amount', 0) or 0
+        if value_amount > 0:
+            currency = getattr(lead, 'value_currency', 'GBP')
+            if value_amount >= 1_000_000:
+                value_str = f" · \U0001f4b0 {currency} {value_amount/1_000_000:.1f}M"
+            elif value_amount >= 1_000:
+                value_str = f" · \U0001f4b0 {currency} {value_amount/1_000:.0f}K"
+
         # Build the card
         card = f"**{i}. [{title}]({url})**"
-        card += f"\n\U0001f3db\ufe0f {source}"
+        card += f"\n{source_badge} · \U0001f3db️ {agency}"
         if desc:
             card += f"\n{desc}"
         badge_line = f"\U0001f4ca Relevance: {relevance:.0%}"
         if deadline and len(deadline) >= 10:
-            badge_line += f" \u00b7 \U0001f4c5 Deadline: {deadline[:10]}"
+            badge_line += f" · \U0001f4c5 Deadline: {deadline[:10]}"
+        else:
+            badge_line += f" · ⚠️ Deadline: check source"
+        badge_line += value_str
         card += f"\n{badge_line}"
 
         formatted_items.append(card)
 
     results_block = "\n\n".join(formatted_items)
-
     # Also build a plain text version for the LLM summary
     plain_list = "\n".join(
         f"{i}. {l.title} ({getattr(l, 'agency', 'Unknown')}) - {l.relevance_score:.0%}"
@@ -738,9 +1253,45 @@ def run_tender_search(query: str) -> tuple[str, dict]:
     parts.append("")
     parts.append("---")
     parts.append("")
-    parts.append(f"_Searched via Bright Data SERP API \u2022 {len(valid_leads)} verified results \u2022 {duration_ms}ms_")
+    # Build a source label reflecting which APIs actually contributed
+    source_parts = []
+    api_portals = _all_api_portals  # reuse from merge step above
+    api_count = len([l for l in valid_leads if getattr(l, 'source_portal', '') in api_portals])
+    serp_count = len(valid_leads) - api_count
+    if api_count > 0:
+        source_parts.append(f"{api_count} from government APIs")
+    if serp_count > 0:
+        source_parts.append(f"{serp_count} from SERP discovery")
+    source_label = " + ".join(source_parts) if source_parts else "government API search"
+
+    parts.append(f"_{source_label} \u2022 {len(valid_leads)} verified results \u2022 {duration_ms}ms_")
 
     reply = "\n".join(parts)
+
+    # Determine which sources contributed
+    sources_used = []
+    portal_to_source = {
+        "ted.europa.eu": "ted_europa",
+        "uk_gov": "uk_gov",
+        "sam.gov": "sam_gov",
+        "boamp": "boamp_france",
+        "world_bank": "world_bank",
+        "prozorro": "prozorro",
+        "canada_buys": "canada_buys",
+        "austender": "austender",
+        "sa_etender": "sa_etender",
+        "colombia_secop": "colombia_secop",
+        "brazil_compras": "brazil_compras",
+        "germany_bkms": "germany_bkms",
+        "italy_anac": "italy_anac",
+        "dominican_dgcp": "dominican_dgcp",
+        "peru_oece": "peru_oece",
+    }
+    for portal_key, source_name in portal_to_source.items():
+        if any(getattr(l, 'source_portal', '') == portal_key for l in valid_leads):
+            sources_used.append(source_name)
+    if serp_count > 0:
+        sources_used.append("brightdata_serp")
 
     metadata = {
         "node": "discover",
@@ -751,7 +1302,9 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         "cost_usd": llm_cost,
         "model": LLM_MODEL,
         "duration_ms": duration_ms,
-        "search_source": "brightdata_serp",
+        "search_sources": sources_used,
+        "api_results": api_count,
+        "serp_results": serp_count,
     }
 
     return reply, metadata

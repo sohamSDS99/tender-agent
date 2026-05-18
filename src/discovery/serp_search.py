@@ -13,10 +13,11 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -25,18 +26,289 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Relevance keywords (same as sam_gov.py for consistency)
+
+# ---------------------------------------------------------------------------
+# Deadline extraction from snippet text
+# ---------------------------------------------------------------------------
+
+# Regex patterns to find deadline/due/closing dates in Google snippets
+# Date-capture fragment shared by all deadline patterns
+_DATE_CAPTURE = (
+    r'(\d{1,2}[\s/\-]\w{3,9}[\s/\-]\d{4}'     # 15 April 2026 / 15-Mar-2026
+    r'|\w{3,9}\s+\d{1,2},?\s+\d{4}'             # April 15, 2026
+    r'|\d{4}[\-/]\d{2}[\-/]\d{2}'                # 2026-04-15
+    r'|\d{1,2}[\-/]\d{1,2}[\-/]\d{4}'            # 04/15/2026
+    r')'
+)
+
+_DEADLINE_PATTERNS: list[re.Pattern[str]] = [
+    # "Deadline: April 15, 2026" / "Deadline on: 13-Mar-2026" / "Due: 15 April 2026"
+    # The (?:on\s*)? handles UNGM's "Deadline on:" format
+    re.compile(
+        r'(?:deadline|due\s*date|closing\s*date|closes|close\s*date|'
+        r'submissions?\s*(?:due|deadline)|response\s*(?:due|deadline)|'
+        r'proposals?\s*due|bids?\s*due|offers?\s*due|submit\s*by)'
+        r'\s*(?:on\s*)?[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # "Open until..." / "Valid through..." / "Expires..."
+    re.compile(
+        r'(?:open\s+until|valid\s+(?:until|through|till)|'
+        r'expir(?:es?|ation|y)\s*(?:date)?)\s*'
+        r'[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # "Published on: 18-Feb-2026" — not a deadline, but captured so we can
+    # at least determine freshness (the bridge's staleness check uses this)
+    re.compile(
+        r'(?:published|posted|released|listed)\s*(?:on\s*)?[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Empty page / no-results detection
+# ---------------------------------------------------------------------------
+_EMPTY_PAGE_INDICATORS: list[str] = [
+    "no tenders found",
+    "no results found",
+    "sorry, no",
+    "0 results",
+    "no matching",
+    "no opportunities found",
+    "check back later",
+    "no records found",
+    "currently no",
+]
+
+
+def is_empty_page_snippet(snippet: str) -> bool:
+    """Detect if a Google snippet suggests the page has zero actual content."""
+    text = snippet.lower()
+    return any(indicator in text for indicator in _EMPTY_PAGE_INDICATORS)
+
+
+# ---------------------------------------------------------------------------
+# Posted-date extraction — detects when a tender was published/released
+# ---------------------------------------------------------------------------
+
+_POSTED_DATE_PATTERNS: list[re.Pattern[str]] = [
+    # "released on Nov 28, 2024" / "posted March 15, 2025" / "published Jan 2025"
+    re.compile(
+        r'(?:released\s+on|posted\s+on|posted|published\s+on|published|'
+        r'date\s+(?:of\s+)?(?:release|publication|posting)|'
+        r'(?:was|were)\s+released|listed\s+on|announced\s+on)\s*'
+        r'[:\-–—]?\s*'
+        r'(\w{3,9}\s+\d{1,2},?\s+\d{4}'             # Nov 28, 2024
+        r'|\d{1,2}\s+\w{3,9}\s+\d{4}'                 # 28 Nov 2024
+        r'|\d{4}[\-/]\d{2}[\-/]\d{2}'                  # 2024-11-28
+        r'|\d{1,2}[\-/]\d{1,2}[\-/]\d{4}'              # 11/28/2024
+        r'|\w{3,9}\s+\d{4}'                            # November 2024 (month+year)
+        r')',
+        re.IGNORECASE,
+    ),
+    # Google snippet date prefix: "Nov 28, 2024 — ..." (already stripped from
+    # snippet by parser, but may survive in raw_data or title)
+    re.compile(
+        r'^(\w{3,9}\s+\d{1,2},?\s+\d{4})\s*[—–\-]',
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_posted_date_from_text(text: str) -> str:
+    """Extract a posted/released/published date from snippet text.
+
+    Returns an ISO-format date string (YYYY-MM-DD) or empty string.
+    """
+    if not text:
+        return ""
+
+    for pattern in _POSTED_DATE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            raw_date = match.group(1).strip()
+            parsed = _parse_date_flexible(raw_date)
+            if parsed:
+                return parsed.strftime("%Y-%m-%d")
+
+    return ""
+
+
+def extract_deadline_from_text(text: str) -> str:
+    """Extract a submission deadline from snippet/description text.
+
+    Tries multiple regex patterns, then parses and validates the date.
+    Returns an ISO-format date string (YYYY-MM-DD) or empty string.
+    """
+    if not text:
+        return ""
+
+    for pattern in _DEADLINE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            raw_date = match.group(1).strip()
+            parsed = _parse_date_flexible(raw_date)
+            if parsed:
+                return parsed.strftime("%Y-%m-%d")
+
+    return ""
+
+
+def _parse_date_flexible(raw: str) -> datetime | None:
+    """Parse a date string in various formats. Returns None on failure.
+
+    Uses a wide lookback window (3 years) so that expired tender dates
+    are still parsed and can be classified as 'expired' downstream,
+    rather than being treated as 'missing deadline'.
+    """
+    try:
+        from dateutil import parser as dateparser
+        parsed = dateparser.parse(raw, dayfirst=False)
+        if parsed:
+            # Sanity check: date should be within a reasonable range
+            # (not in the distant past or far future)
+            now = datetime.now(timezone.utc)
+            # Allow dates up to 3 years in the past (to detect expired tenders)
+            # and up to 2 years in the future
+            min_date = now - timedelta(days=1095)
+            max_date = now + timedelta(days=730)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if min_date <= parsed <= max_date:
+                return parsed
+        return None
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# Tender signal detection — is this actually a procurement page?
+# ---------------------------------------------------------------------------
+# A result must have at least ONE of these signals to be considered a tender.
+# Without this check, news articles and blog posts about chemical safety
+# score high on SDS keywords but are completely useless.
+# ---------------------------------------------------------------------------
+
+# Regex patterns that indicate procurement/tender language in snippets
+_TENDER_SNIPPET_SIGNALS: list[re.Pattern[str]] = [
+    re.compile(r'\brfp\b', re.IGNORECASE),
+    re.compile(r'\brfq\b', re.IGNORECASE),
+    re.compile(r'\brfi\b', re.IGNORECASE),
+    re.compile(r'\bsolicitation\b', re.IGNORECASE),
+    re.compile(r'\bprocurement\s+opportunit', re.IGNORECASE),
+    re.compile(r'\bcontract\s+(?:opportunit|notice|award)', re.IGNORECASE),
+    re.compile(r'\bbid\s*(?:ding|submission|s\b)', re.IGNORECASE),
+    re.compile(r'\bsubmit\s+(?:by|before|proposal|your|a\s+)', re.IGNORECASE),
+    re.compile(r'\bclosing\s+date\b', re.IGNORECASE),
+    re.compile(r'\bdeadline\b', re.IGNORECASE),
+    re.compile(r'\bdue\s+date\b', re.IGNORECASE),
+    re.compile(r'\bnotice\s+(?:number|no|id)\b', re.IGNORECASE),
+    re.compile(r'\breference\s*(?:number|no|id|:)\s*\S', re.IGNORECASE),
+    re.compile(r'\bexpress\s+interest\b', re.IGNORECASE),
+    re.compile(r'\binvitation\s+to\s+bid\b', re.IGNORECASE),
+    re.compile(r'\bcall\s+for\s+(?:proposals?|tenders?|expressions?)', re.IGNORECASE),
+    re.compile(r'\bopen\s+tender\b', re.IGNORECASE),
+    re.compile(r'\bpublic\s+tender\b', re.IGNORECASE),
+    re.compile(r'\btender\s+(?:notice|ref|id|number)', re.IGNORECASE),
+    re.compile(r'\bpurchas(?:ing|e)\s+(?:office|department|agent)', re.IGNORECASE),
+    re.compile(r'\bregistration\s+(?:level|required)\b', re.IGNORECASE),
+]
+
+# Domains that are definitively tender/procurement portals.
+# A result from one of these domains automatically has a "tender signal"
+# even if the snippet doesn't contain procurement language.
+KNOWN_TENDER_PORTALS: set[str] = {
+    "sam.gov", "ted.europa.eu", "ungm.org", "merx.com",
+    "bidnetdirect.com", "virginiabids.com", "highergov.com",
+    "tendersontime.com", "buyandsell.gc.ca", "bidsandtenders.ca",
+    "tenders.gov.au", "eprocure.gov.in", "etenders.gov.za",
+    "globaltenders.com", "dgmarket.com", "devbusiness.com",
+    "contracts.gov.sg", "etimaden.gov.tr",
+    "nswtenders.com.au", "qtenders.qld.gov.au", "eprocure.com.au",
+    "bhutantenders.com", "tendersinfo.com", "tendertiger.com",
+    "publictendering.com", "tenderlink.com",
+}
+
+# URL path patterns that indicate a specific tender/solicitation page
+TENDER_URL_SIGNALS: list[str] = [
+    "/opp/", "/notice/", "/solicitation", "/bid/", "/rfp/",
+    "/tender/", "/procurement/", "/contract-opportunity/",
+    "/open-bids/", "/opportunity/", "/search-rfp/",
+    "/contract/", "/award/", "/announcement/",
+]
+
+
+def has_tender_signal(title: str, snippet: str, url: str) -> bool:
+    """Check if a search result looks like an actual procurement/tender page.
+
+    Returns True if ANY of these are true:
+      - Snippet contains procurement-specific language (RFP, deadline, bid, etc.)
+      - URL domain is a known tender portal
+      - URL path contains tender-like patterns
+    """
+    from urllib.parse import urlparse
+
+    # Check 1: Snippet/title contains procurement language
+    text = f"{title} {snippet}"
+    for pattern in _TENDER_SNIPPET_SIGNALS:
+        if pattern.search(text):
+            return True
+
+    # Check 2: Domain is a known tender portal
+    try:
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        for portal in KNOWN_TENDER_PORTALS:
+            if portal in domain:
+                return True
+
+        # Check 3: URL path has tender-like patterns
+        path = urlparse(url).path.lower()
+        for sig in TENDER_URL_SIGNALS:
+            if sig in path:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Relevance scoring keywords
+# ---------------------------------------------------------------------------
+# STRONG = high-confidence SDS/EHS terms (each worth 0.15)
+# PARTIAL = general tender/compliance terms (each worth 0.05)
+# CONTEXT_DEPENDENT = ambiguous terms that only count when a CONTEXT_ANCHOR
+#   word also appears (prevents "Transport Sds" false positives)
+# ---------------------------------------------------------------------------
+
 STRONG_KEYWORDS: list[str] = [
-    "safety data sheet", "sds", "msds",
+    "safety data sheet", "msds",
     "chemical safety", "chemical management", "chemical inventory",
     "ghs", "globally harmonized",
-    "ehs", "environment health safety", "environmental health",
+    "environment health safety", "environmental health",
     "hazardous material", "hazardous chemical", "hazmat",
     "osha", "hcs", "hazard communication",
     "regulatory compliance", "compliance software",
     "sds management", "sds authoring",
     "tier ii", "epcra", "toxic release",
     "workplace safety", "occupational safety",
+]
+
+# These terms are ambiguous on their own — "sds" can be a company name,
+# "ehs" can be an abbreviation for many things.  They only count as strong
+# matches when accompanied by a CONTEXT_ANCHOR word.
+CONTEXT_DEPENDENT_KEYWORDS: list[str] = [
+    "sds", "ehs",
+]
+
+CONTEXT_ANCHORS: list[str] = [
+    "chemical", "safety", "hazard", "compliance", "management",
+    "regulatory", "environment", "occupational", "ghs", "osha",
+    "data sheet", "authoring", "inventory",
 ]
 
 PARTIAL_KEYWORDS: list[str] = [
@@ -81,11 +353,13 @@ REGIONAL_PORTALS: dict[str, list[str]] = {
 
 # Keywords that map to regions
 REGION_KEYWORDS: dict[str, list[str]] = {
-    "europe": ["europe", "european", "eu", "uk", "germany", "france", "spain", "italy", "netherlands", "sweden", "norway", "denmark", "finland", "belgium", "austria", "switzerland", "poland", "ireland", "portugal", "czech", "romania", "hungary", "greece"],
+    "europe": ["europe", "european", "eu", "uk", "germany", "france", "spain", "italy", "netherlands", "sweden", "norway", "denmark", "finland", "belgium", "austria", "switzerland", "poland", "ireland", "portugal", "czech", "romania", "hungary", "greece", "ukraine", "moldova", "georgia", "kosovo"],
     "usa": ["usa", "us", "united states", "america", "federal", "sam.gov"],
     "canada": ["canada", "canadian"],
     "australia": ["australia", "australian"],
     "india": ["india", "indian"],
+    "south_america": ["brazil", "brazilian", "colombia", "colombian", "peru", "peruvian", "ecuador", "chile", "argentina", "south america", "latin america", "dominican republic", "honduras", "guatemala", "caribbean"],
+    "africa": ["south africa", "african", "africa", "nigeria", "kenya", "rwanda", "ghana"],
 }
 
 
@@ -121,6 +395,8 @@ REGION_EXCLUDE_DOMAINS: dict[str, list[str]] = {
     "canada": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "ted.europa.eu", "tenders.gov.au", "eprocure.gov.in"],
     "australia": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "highergov.com", "ted.europa.eu", "merx.com", "eprocure.gov.in", "buyandsell.gc.ca"],
     "india": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "ted.europa.eu", "merx.com", "tenders.gov.au"],
+    "south_america": ["sam.gov", "ted.europa.eu", "tenders.gov.au", "eprocure.gov.in"],
+    "africa": ["sam.gov", "ted.europa.eu", "tenders.gov.au", "eprocure.gov.in"],
 }
 
 REGION_COUNTRY_NAMES: dict[str, list[str]] = {
@@ -129,11 +405,27 @@ REGION_COUNTRY_NAMES: dict[str, list[str]] = {
     "canada": ["Canada", "Canadian"],
     "australia": ["Australia", "Australian", "NSW", "Victoria", "Queensland"],
     "india": ["India", "Indian"],
+    "south_america": ["South America", "Latin America", "Brazil", "Colombia", "Peru"],
+    "africa": ["Africa", "South Africa", "Nigeria", "Kenya"],
 }
 
 
+# Negative terms appended to general (non-portal) queries to tell Google
+# to exclude news articles, blog posts, and informational content.
+# Portal-specific queries (site:...) don't need these because the portal
+# itself is a procurement site.
+NOISE_EXCLUSION = (
+    '-blog -article -magazine -webinar -"white paper" '
+    '-"case study" -news -training -podcast -conference'
+)
+
+
 def build_search_queries(user_query: str) -> list[str]:
-    """Build targeted search queries based on what the user actually asked for."""
+    """Build targeted search queries based on what the user actually asked for.
+
+    General queries include noise exclusion terms to filter out news/articles.
+    Portal-specific queries rely on the portal's own curation.
+    """
     region = detect_region(user_query)
     portals = REGIONAL_PORTALS.get(region, REGIONAL_PORTALS["global"])
     country_names = REGION_COUNTRY_NAMES.get(region, [])
@@ -144,20 +436,30 @@ def build_search_queries(user_query: str) -> list[str]:
     # Region label for queries
     region_label = country_names[0] if country_names else ""
 
+    # Current year for recency bias
+    current_year = str(datetime.now(timezone.utc).year)
+
     queries = []
 
-    # Query 1: User's own query + tender keywords + region emphasis
-    queries.append(f'{user_query} tender OR RFP OR procurement OR solicitation')
+    # Query 1: User's own query + tender keywords + noise exclusion
+    queries.append(
+        f'{user_query} tender OR RFP OR procurement OR solicitation {NOISE_EXCLUSION}'
+    )
 
-    # Query 2-3: Region-specific portal searches
+    # Query 2-3: Portal searches — NO year, NO noise exclusion.
+    # Portal sites curate active procurement listings.
     for portal in portals[:2]:
         queries.append(f'{portal} {core_terms}')
 
-    # Query 4: Region-specific broader search
+    # Query 4: Broad regional search with year + noise exclusion
     if region_label:
-        queries.append(f'{core_terms} "{region_label}" tender OR RFP OR procurement 2026')
+        queries.append(
+            f'{core_terms} "{region_label}" tender OR RFP OR procurement {current_year} {NOISE_EXCLUSION}'
+        )
     else:
-        queries.append(f'{core_terms} tender OR RFP OR procurement 2026')
+        queries.append(
+            f'{core_terms} tender OR RFP OR procurement {current_year} {NOISE_EXCLUSION}'
+        )
 
     return queries
 
@@ -185,17 +487,35 @@ class SerpTenderLead:
     raw_data: dict[str, Any] = field(default_factory=dict)
 
 
-def score_relevance(title: str, description: str) -> tuple[float, list[str]]:
-    """Score how relevant a search result is to SDS/EHS tenders."""
+def score_relevance(title: str, description: str) -> tuple[float, list[str], bool]:
+    """Score how relevant a search result is to SDS/EHS tenders.
+
+    Returns:
+        (score, matched_keywords, has_strong_match)
+        has_strong_match is True when at least one unambiguous SDS/EHS
+        keyword was found — used downstream to gate low-quality results.
+    """
     text = f"{title} {description}".lower()
     matched: list[str] = []
 
+    # 1. Unambiguous strong keywords
     strong_matches = 0
     for kw in STRONG_KEYWORDS:
         if kw in text:
             matched.append(kw)
             strong_matches += 1
 
+    # 2. Context-dependent keywords (e.g. "sds", "ehs") — only count when
+    #    a context anchor word also appears in the text
+    has_context = any(anchor in text for anchor in CONTEXT_ANCHORS)
+    for kw in CONTEXT_DEPENDENT_KEYWORDS:
+        if kw in text and kw not in matched:
+            if has_context:
+                matched.append(kw)
+                strong_matches += 1
+            # If no context anchor, skip — "Transport Sds" ≠ Safety Data Sheet
+
+    # 3. Partial keywords
     partial_matches = 0
     for kw in PARTIAL_KEYWORDS:
         if kw in text and kw not in matched:
@@ -206,7 +526,7 @@ def score_relevance(title: str, description: str) -> tuple[float, list[str]]:
     partial_score = min(partial_matches * 0.05, 0.25)
     total = min(strong_score + partial_score, 1.0)
 
-    return round(total, 2), matched
+    return round(total, 2), matched, strong_matches > 0
 
 
 class SerpTenderSearcher:
@@ -263,7 +583,13 @@ class SerpTenderSearcher:
 
         for query in search_queries[:4]:  # Limit to 4 queries to stay within rate limits
             try:
-                results = self._search_google(query, max_results_per_query)
+                # Portal-specific queries (site:...) skip the date filter —
+                # the portal itself curates active listings.
+                is_portal_query = query.strip().startswith("site:")
+                results = self._search_google(
+                    query, max_results_per_query,
+                    use_date_filter=not is_portal_query,
+                )
                 for result in results:
                     url = result.get("link", "")
                     if url in seen_urls:
@@ -272,20 +598,35 @@ class SerpTenderSearcher:
 
                     title = result.get("title", "")
                     snippet = result.get("snippet", "")
-                    score, keywords = score_relevance(title, snippet)
+                    score, keywords, has_strong = score_relevance(title, snippet)
+
+                    # Extract deadline and posted date from the snippet text
+                    combined_text = f"{title} {snippet}"
+                    deadline = extract_deadline_from_text(combined_text)
+                    posted = extract_posted_date_from_text(combined_text)
 
                     if score >= self.min_relevance:
+                        # Compute classification signals for downstream filtering
+                        tender_signal = has_tender_signal(title, snippet, url)
+                        empty_page = is_empty_page_snippet(snippet)
+
                         lead = SerpTenderLead(
                             lead_id=f"SERP-{uuid.uuid4().hex[:8].upper()}",
                             title=title,
                             description=snippet,
                             source_url=url,
                             agency=self._extract_domain(url),
+                            submission_deadline=deadline,
                             relevance_score=score,
                             relevance_keywords=keywords,
                             search_query=query,
-                            posted_date=datetime.now(timezone.utc).isoformat(),
-                            raw_data=result,
+                            posted_date=posted or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                            raw_data={
+                                **result,
+                                "has_strong_match": has_strong,
+                                "has_tender_signal": tender_signal,
+                                "is_empty_page": empty_page,
+                            },
                         )
                         all_leads.append(lead)
 
@@ -330,11 +671,26 @@ class SerpTenderSearcher:
             client.close()
         return valid
 
-    def _search_google(self, query: str, num_results: int = 10) -> list[dict]:
-        """Execute a Google search via Bright Data SERP proxy."""
-        search_url = f"https://www.google.com/search?q={quote_plus(query)}&num={num_results}"
+    def _search_google(
+        self, query: str, num_results: int = 10, *, use_date_filter: bool = True,
+    ) -> list[dict]:
+        """Execute a Google search via Bright Data SERP proxy.
 
-        logger.info("serp_query", query=query[:80])
+        Args:
+            use_date_filter: When True, appends tbs=qdr:m6 (past 6 months)
+                to the URL.  Set to False for portal-specific ``site:``
+                queries where the portal already curates active listings.
+        """
+        search_url = (
+            f"https://www.google.com/search"
+            f"?q={quote_plus(query)}"
+            f"&num={num_results}"
+        )
+        if use_date_filter:
+            search_url += "&tbs=qdr:m6"
+
+        date_label = "past_6mo" if use_date_filter else "none"
+        logger.info("serp_query", query=query[:80], date_filter=date_label)
 
         client = httpx.Client(proxy=self.proxy_url, verify=False, timeout=30.0)
         try:

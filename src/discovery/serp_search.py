@@ -64,6 +64,9 @@ REGIONAL_PORTALS: dict[str, list[str]] = {
     ],
     "australia": [
         "site:tenders.gov.au",
+        "site:tendersontime.com australia",
+        "site:globaltenders.com australia",
+        "site:eprocure.com.au OR site:nswtenders.com.au OR site:qtenders.qld.gov.au",
     ],
     "india": [
         "site:eprocure.gov.in",
@@ -87,37 +90,82 @@ REGION_KEYWORDS: dict[str, list[str]] = {
 
 
 def detect_region(query: str) -> str:
-    """Detect which region the user is asking about."""
+    """Detect which region the user is asking about.
+
+    Uses word-boundary matching to avoid false positives
+    (e.g., 'us' matching inside 'Australian').
+    """
+    import re
     q = query.lower()
+
+    # Check longer/more specific keywords first by sorting by length descending
+    matches: list[tuple[str, int]] = []
     for region, keywords in REGION_KEYWORDS.items():
         for kw in keywords:
-            if kw in q:
-                return region
+            # Use word boundary matching to avoid substring false positives
+            pattern = r'\b' + re.escape(kw) + r'\b'
+            if re.search(pattern, q):
+                matches.append((region, len(kw)))
+
+    if matches:
+        # Return the region with the longest keyword match (most specific)
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches[0][0]
+
     return "global"
+
+
+REGION_EXCLUDE_DOMAINS: dict[str, list[str]] = {
+    "europe": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "merx.com", "tenders.gov.au", "eprocure.gov.in"],
+    "usa": ["ted.europa.eu", "tenders.gov.au", "merx.com", "eprocure.gov.in", "buyandsell.gc.ca"],
+    "canada": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "ted.europa.eu", "tenders.gov.au", "eprocure.gov.in"],
+    "australia": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "highergov.com", "ted.europa.eu", "merx.com", "eprocure.gov.in", "buyandsell.gc.ca"],
+    "india": ["sam.gov", "bidnetdirect.com", "virginiabids.com", "ted.europa.eu", "merx.com", "tenders.gov.au"],
+}
+
+REGION_COUNTRY_NAMES: dict[str, list[str]] = {
+    "europe": ["Europe", "EU", "UK", "European"],
+    "usa": ["United States", "US", "USA", "federal"],
+    "canada": ["Canada", "Canadian"],
+    "australia": ["Australia", "Australian", "NSW", "Victoria", "Queensland"],
+    "india": ["India", "Indian"],
+}
 
 
 def build_search_queries(user_query: str) -> list[str]:
     """Build targeted search queries based on what the user actually asked for."""
     region = detect_region(user_query)
     portals = REGIONAL_PORTALS.get(region, REGIONAL_PORTALS["global"])
+    country_names = REGION_COUNTRY_NAMES.get(region, [])
 
     # Core SDS/EHS terms
     core_terms = '"safety data sheet" OR "SDS" OR "chemical safety" OR "EHS"'
 
+    # Region label for queries
+    region_label = country_names[0] if country_names else ""
+
     queries = []
 
-    # Query 1: User's own query + tender keywords
+    # Query 1: User's own query + tender keywords + region emphasis
     queries.append(f'{user_query} tender OR RFP OR procurement OR solicitation')
 
     # Query 2-3: Region-specific portal searches
     for portal in portals[:2]:
         queries.append(f'{portal} {core_terms}')
 
-    # Query 4: Broader search with region context
-    region_label = region if region != "global" else ""
-    queries.append(f'{core_terms} {region_label} tender OR RFP OR procurement 2026')
+    # Query 4: Region-specific broader search
+    if region_label:
+        queries.append(f'{core_terms} "{region_label}" tender OR RFP OR procurement 2026')
+    else:
+        queries.append(f'{core_terms} tender OR RFP OR procurement 2026')
 
     return queries
+
+
+def get_excluded_domains_for_region(user_query: str) -> set[str]:
+    """Get domains that should be excluded based on the user's requested region."""
+    region = detect_region(user_query)
+    return set(REGION_EXCLUDE_DOMAINS.get(region, []))
 
 
 @dataclass

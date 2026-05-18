@@ -1,0 +1,33 @@
+# =============================================================================
+# Tender Agent Bridge — Fly.io Configuration
+#
+# This runs the Python bridge that connects the tender-agent to Nexus AMS.
+# It's a long-running process (not HTTP), so we use a "machine" not a "service".
+#
+# To deploy:
+#   1. Install flyctl: curl -L https://fly.io/install.sh | sh
+#   2. Login: flyctl auth login
+#   3. Create app: flyctl apps create tender-agent-bridge
+#   4. Set secrets:
+#      flyctl secrets set \
+#        DASHSCOPE_API_KEY="sk-or-v1-..." \
+#        NEXUS_AMS_URL="https://nexus-ams.fly.dev" \
+#        BRIGHTDATA_SERP_PROXY="http://..." \
+#        VOYAGE_API_KEY="pa-..." \
+#        DRY_RUN="false"
+#   5. Deploy: flyctl deploy
+# =============================================================================
+
+app = "tender-agent-bridge"
+primary_region = "syd"
+
+[build]
+  builder = "paketobuildpacks/builder:base"
+
+[processes]
+  bridge = "python scripts/nexus_bridge.py"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["bridge"]

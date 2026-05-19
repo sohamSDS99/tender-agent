@@ -5,9 +5,15 @@ This script connects the tender-agent to the Nexus AMS platform.
 
 It does 4 things:
 1. Registers the agent and sends heartbeats (so AMS knows the agent is alive)
-2. Polls for incoming chat messages from the AMS UI
-3. Runs tender discovery searches and sends results back to the AMS chat
-4. Fills tender forms uploaded by users using company context documents
+2. Polls /api/agents/tender-agent/search-jobs for filter-driven tender searches
+   queued from the AMS UI, runs them, and pushes structured results back via
+   /api/agents/tender-agent/discovered-tenders
+3. Polls /api/agents/tender-agent/tasks for fill_form tasks (created from a
+   TenderPursuit when the admin selects Agent fill mode), fills the attached
+   form via the existing form_parser + form_filler + form_writer pipeline,
+   and submits the completed file for human approval via /api/submissions/create
+4. Sends Slack notifications on search completion (when any result has
+   relevance > 0.70) and on form-fill task completion or failure
 
 Usage:
     cd ~/Desktop/tender-agent
@@ -805,1174 +811,914 @@ def _strip_deep_trigger(query: str) -> str:
     return cleaned.strip()
 
 
-def run_tender_search(query: str) -> tuple[str, dict]:
-    """Run tender discovery — APIs first, SERP as automatic fallback.
+# ---------------------------------------------------------------------------
+# Tender Search — filter-driven, runs APIs first then SERP fallback
+# ---------------------------------------------------------------------------
 
-    Architecture:
-      STEP 1: Run all 20 government APIs (region-routed).
-      STEP 2: Strict deadline filter — block any API result without a
-              verified future deadline. Zero exceptions.
-      STEP 3: If API results exist after filtering → show them. Done.
-      STEP 4: If APIs returned ZERO results → automatically fall back to
-              SERP (Google via Bright Data). Every SERP result gets its
-              actual page fetched to extract and verify the deadline.
-              Expired/closed/no-deadline → blocked. No exceptions.
+# Map source_portal (used by Lead objects) to the canonical source name we
+# return in DiscoveredTender rows. Stable across both the bridge and the AMS.
+_PORTAL_TO_SOURCE: dict[str, str] = {
+    "ted.europa.eu":  "ted_europa",
+    "uk_gov":         "uk_tenders",
+    "sam.gov":        "sam_gov",
+    "boamp":          "boamp_france",
+    "world_bank":     "world_bank",
+    "prozorro":       "prozorro",
+    "canada_buys":    "canada_buys",
+    "austender":      "austender",
+    "sa_etender":     "sa_etender",
+    "colombia_secop": "colombia_secop",
+    "brazil_compras": "brazil_compras",
+    "germany_bkms":   "germany_bkms",
+    "italy_anac":     "italy_anac",
+    "dominican_dgcp": "dominican_dgcp",
+    "peru_oece":      "peru_oece",
+    "world_bank_v2":  "world_bank_v2",
+    "nigeria_nocopo": "nigeria_nocopo",
+    "kenya_ppra":     "kenya_ppra",
+    "uganda_gpp":     "uganda_gpp",
+    "mexico_cdmx":    "mexico_cdmx",
+    "google_serp":    "serp_fallback",
+}
 
-    Every result the user sees has a verified, future submission deadline.
+# Portal → canonical region (used to set DiscoveredTender.region when the
+# Lead object doesn't carry it directly).
+_PORTAL_TO_REGION: dict[str, str] = {
+    "ted.europa.eu":  "europe",
+    "uk_gov":         "uk",
+    "sam.gov":        "usa",
+    "boamp":          "europe",
+    "world_bank":     "global",
+    "prozorro":       "europe",
+    "canada_buys":    "canada",
+    "austender":      "australia",
+    "sa_etender":     "africa",
+    "colombia_secop": "south_america",
+    "brazil_compras": "south_america",
+    "germany_bkms":   "europe",
+    "italy_anac":     "europe",
+    "dominican_dgcp": "south_america",
+    "peru_oece":      "south_america",
+    "world_bank_v2":  "global",
+    "nigeria_nocopo": "africa",
+    "kenya_ppra":     "africa",
+    "uganda_gpp":     "africa",
+    "mexico_cdmx":    "south_america",
+    "google_serp":    None,
+}
+
+# Absolute floor — wins even when the user-supplied minRelevance is lower.
+ABSOLUTE_RELEVANCE_FLOOR = 0.30
+
+
+def _parse_iso_date(value):
+    """Parse a string like '2026-05-19' or '2026-05-19T00:00:00Z' to a date.
+
+    Returns None on any failure or if value is falsy.
     """
-    start_time = time.perf_counter()
+    if not value:
+        return None
+    try:
+        from dateutil import parser as dateparser
+        return dateparser.parse(str(value)).date()
+    except Exception:
+        return None
+
+
+def _iso_or_none(value):
+    """Coerce a deadline/date field to ISO-8601 string with time, or None."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s or len(s) < 8:
+        return None
+    try:
+        from dateutil import parser as dateparser
+        dt = dateparser.parse(s)
+        # Anchor naive timestamps to UTC end-of-day so the AMS DateTime column
+        # stays consistent across timezones.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        return None
+
+
+def _lead_to_tender(lead, search_query: str) -> dict:
+    """Translate a Lead object into the DiscoveredTender payload shape.
+
+    AMS expects a flat dict per the spec. fingerprint = sha256(source + ":" + sourceId)
+    which deduplicates the same tender across overlapping queries / regions.
+    """
+    import hashlib
+
+    portal = getattr(lead, "source_portal", "") or ""
+    source = _PORTAL_TO_SOURCE.get(portal, portal or "unknown")
+    source_id = (
+        getattr(lead, "lead_id", None)
+        or getattr(lead, "source_id", None)
+        or getattr(lead, "ocid", None)
+        or getattr(lead, "tender_id", None)
+        or getattr(lead, "source_url", "")
+    )
+    fp = hashlib.sha256(f"{source}:{source_id}".encode("utf-8")).hexdigest()
+
+    value_amount = getattr(lead, "value_amount", None) or 0
+    currency = getattr(lead, "value_currency", None) or None
+    value_raw = None
+    if value_amount and currency:
+        value_raw = f"{currency} {value_amount:,.0f}"
+    elif value_amount:
+        value_raw = f"{value_amount:,.0f}"
+
+    raw_data = getattr(lead, "raw_data", None)
+    if not isinstance(raw_data, dict):
+        raw_data = {}
+    cpv = raw_data.get("cpv_code") or getattr(lead, "cpv_code", None)
+    country = raw_data.get("country") or getattr(lead, "country", None)
+
+    submission_iso = _iso_or_none(getattr(lead, "submission_deadline", "") or "")
+    # The strict + safety-net filters guarantee a deadline exists, but be defensive.
+    if not submission_iso:
+        return None
+
+    return {
+        "fingerprint": fp,
+        "source": source,
+        "sourceId": str(source_id)[:500],
+        "title": (getattr(lead, "title", "") or "")[:1000],
+        "description": (getattr(lead, "description", "") or None),
+        "agency": (getattr(lead, "agency", "") or None),
+        "country": (str(country)[:10] if country else None),
+        "region": _PORTAL_TO_REGION.get(portal),
+        "category": None,
+        "submissionDeadline": submission_iso,
+        "postedDate": _iso_or_none(getattr(lead, "posted_date", "") or ""),
+        "contractValueUsd": (float(value_amount) if value_amount else None),
+        "contractValueRaw": value_raw,
+        "currency": currency,
+        "url": (getattr(lead, "source_url", "") or "")[:2000],
+        "cpvCode": (str(cpv)[:50] if cpv else None),
+        "relevanceScore": float(getattr(lead, "relevance_score", 0) or 0),
+        "rawPayload": {
+            "search_query": search_query,
+            "source_portal": portal,
+            "raw_data": raw_data,
+            "value_amount": value_amount,
+            "value_currency": currency,
+        },
+    }
+
+
+def run_tender_search(filters: dict) -> dict:
+    """Run filter-driven tender discovery — APIs first, optional SERP fallback.
+
+    Architecture preserved from Session 3:
+      STEP 1: Run all 20 government APIs (region-routed via filters["regions"],
+              source-gated via filters["sources"]).
+      STEP 2: Strict deadline filter — block any API result without a verified
+              future deadline. Zero exceptions.
+      STEP 2b: Relevance floor — max(filters["minRelevance"], 0.30). Absolute
+              30% floor always wins.
+      STEP 3: If API results exist after filtering, return them. SERP skipped.
+      STEP 4: Otherwise, if filters["includeSerpFallback"] is True, run SERP
+              with page-fetch deadline verification on every lead.
+      STEP 5: Final safety net at output time — re-verify every deadline.
+      STEP 6: Apply post-filters from the form: deadline window, contract
+              value range, posted-within-days.
+
+    Returns a structured dict the AMS persists to DiscoveredTender:
+        {
+          "tenders": [ { fingerprint, source, sourceId, ... } ],
+          "stats":   { totalFound, blockedExpired, blockedRelevance, deduplicated }
+        }
+    """
     from src.discovery.serp_search import detect_region
 
-    search_query = query
-    detected_region = detect_region(search_query)
+    start_time = time.perf_counter()
+
+    search_query = (filters.get("keywords") or "").strip()
+    regions_filter = set(filters.get("regions") or [])
+    if not regions_filter:
+        regions_filter = {"global"}
+    # If user selects global, fire all region-gated APIs.
+    if "global" in regions_filter:
+        regions_filter = regions_filter | {
+            "usa", "europe", "uk", "canada", "australia",
+            "india", "africa", "south_america",
+        }
+
+    sources_filter = set(filters.get("sources") or [])
+    all_sources_allowed = not sources_filter
+
+    def region_match(*allowed: str) -> bool:
+        return any(r in regions_filter for r in allowed)
+
+    def src_on(name: str) -> bool:
+        return all_sources_allowed or name in sources_filter
+
+    include_serp = bool(filters.get("includeSerpFallback", True))
+    user_min_relevance = float(filters.get("minRelevance") or ABSOLUTE_RELEVANCE_FLOOR)
+    relevance_floor = max(user_min_relevance, ABSOLUTE_RELEVANCE_FLOOR)
 
     print(f"\n{'='*60}")
     print(f"  Tender search: '{search_query[:80]}'")
-    print(f"  Region: {detected_region} | Mode: APIs-first, SERP-fallback")
+    print(f"  Regions: {sorted(regions_filter)}")
+    print(f"  Sources: {'ALL' if all_sources_allowed else sorted(sources_filter)}")
+    print(f"  Min relevance: {relevance_floor:.0%} | SERP fallback: {include_serp}")
     print(f"{'='*60}")
 
-    # ------------------------------------------------------------------
-    # Step 1: Direct API sources (structured, reliable, ALWAYS run)
-    # ------------------------------------------------------------------
     api_leads: list = []
 
-    # TED Europa — for Europe queries (or global)
-    if detected_region in ("europe", "uk", "global"):
+    # ------------------------------------------------------------------
+    # Step 1: Direct API sources (structured, reliable). Each block is
+    # gated by both region_match(...) AND src_on(source_name) so a user
+    # can disable individual portals via the filter form.
+    # ------------------------------------------------------------------
+
+    # TED Europa
+    if region_match("europe", "uk", "global") and src_on("ted_europa"):
         try:
             print("  [TED API] Querying TED Europa for active EU tenders...")
-            ted_searcher = TedEuropaSearcher()
-            ted_leads = ted_searcher.search(user_query=search_query, max_results=15)
+            ted_leads = TedEuropaSearcher().search(user_query=search_query, max_results=15)
             api_leads.extend(ted_leads)
             print(f"  [TED API] Got {len(ted_leads)} structured results")
-            _audit(
-                "tool_call",
-                f"TED Europa API returned {len(ted_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "ted_europa", "count": len(ted_leads)},
-            )
+            _audit("tool_call", f"TED Europa API returned {len(ted_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "ted_europa", "count": len(ted_leads)})
         except Exception as exc:
             print(f"  [TED API] Failed: {exc}")
-            _audit(
-                "tool_call", f"TED Europa API failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"TED Europa API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # UK Contracts Finder + Find a Tender — for UK queries (or global/europe)
-    if detected_region in ("uk", "europe", "global"):
+    # UK Contracts Finder + Find a Tender
+    if region_match("uk", "europe", "global") and src_on("uk_tenders"):
         try:
             print("  [UK API] Querying Contracts Finder + Find a Tender...")
-            uk_searcher = UkTenderSearcher()
-            uk_leads = uk_searcher.search(user_query=search_query, max_results=15, days_back=60)
+            uk_leads = UkTenderSearcher().search(user_query=search_query, max_results=15, days_back=60)
             api_leads.extend(uk_leads)
             print(f"  [UK API] Got {len(uk_leads)} relevant UK tenders")
-            _audit(
-                "tool_call",
-                f"UK Tenders API returned {len(uk_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "uk_gov", "count": len(uk_leads)},
-            )
+            _audit("tool_call", f"UK Tenders API returned {len(uk_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "uk_tenders", "count": len(uk_leads)})
         except Exception as exc:
             print(f"  [UK API] Failed: {exc}")
-            _audit(
-                "tool_call", f"UK Tenders API failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"UK Tenders API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # SAM.gov — for US queries (if API key available)
+    # SAM.gov
     sam_api_key = os.getenv("SAM_GOV_API_KEY", "")
-    if detected_region in ("usa", "global") and sam_api_key:
+    if region_match("usa", "global") and src_on("sam_gov") and sam_api_key:
         try:
             print("  [SAM API] Querying SAM.gov for active US tenders...")
-            sam_scraper = SamGovScraper(dry_run=False)
-            sam_leads = sam_scraper.fetch_opportunities(days_back=30)
+            sam_leads = SamGovScraper(dry_run=False).fetch_opportunities(days_back=30)
             api_leads.extend(sam_leads)
             print(f"  [SAM API] Got {len(sam_leads)} structured results")
-            _audit(
-                "tool_call",
-                f"SAM.gov API returned {len(sam_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "sam_gov", "count": len(sam_leads)},
-            )
+            _audit("tool_call", f"SAM.gov API returned {len(sam_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "sam_gov", "count": len(sam_leads)})
         except Exception as exc:
             print(f"  [SAM API] Failed: {exc}")
-    elif detected_region in ("usa", "global") and not sam_api_key:
-        print("  [SAM API] Skipped — SAM_GOV_API_KEY not set (register at sam.gov)")
+    elif region_match("usa", "global") and src_on("sam_gov") and not sam_api_key:
+        print("  [SAM API] Skipped — SAM_GOV_API_KEY not set")
 
-    # BOAMP (France) — for Europe/France queries (or global)
-    if detected_region in ("europe", "global"):
+    # BOAMP France
+    if region_match("europe", "global") and src_on("boamp_france"):
         try:
             print("  [BOAMP API] Querying French BOAMP for active tenders...")
-            boamp_searcher = BoampSearcher()
-            boamp_leads = boamp_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            boamp_leads = BoampSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(boamp_leads)
             print(f"  [BOAMP API] Got {len(boamp_leads)} relevant French tenders")
-            _audit(
-                "tool_call",
-                f"BOAMP API returned {len(boamp_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "boamp", "count": len(boamp_leads)},
-            )
+            _audit("tool_call", f"BOAMP API returned {len(boamp_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "boamp_france", "count": len(boamp_leads)})
         except Exception as exc:
             print(f"  [BOAMP API] Failed: {exc}")
-            _audit(
-                "tool_call", f"BOAMP API failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"BOAMP API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # World Bank Procurement — for global and non-Western-market queries
-    if detected_region in ("global", "india", "australia"):
+    # World Bank v1
+    if region_match("global", "india", "australia") and src_on("world_bank"):
         try:
             print("  [World Bank API] Querying World Bank procurement notices...")
-            wb_searcher = WorldBankSearcher()
-            wb_leads = wb_searcher.search(user_query=search_query, max_results=10, days_back=90)
+            wb_leads = WorldBankSearcher().search(user_query=search_query, max_results=10, days_back=90)
             api_leads.extend(wb_leads)
             print(f"  [World Bank API] Got {len(wb_leads)} relevant tenders")
-            _audit(
-                "tool_call",
-                f"World Bank API returned {len(wb_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "world_bank", "count": len(wb_leads)},
-            )
+            _audit("tool_call", f"World Bank API returned {len(wb_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "world_bank", "count": len(wb_leads)})
         except Exception as exc:
             print(f"  [World Bank API] Failed: {exc}")
-            _audit(
-                "tool_call", f"World Bank API failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"World Bank API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Prozorro (Ukraine) — for Europe/global queries
-    if detected_region in ("europe", "global"):
+    # Prozorro
+    if region_match("europe", "global") and src_on("prozorro"):
         try:
             print("  [Prozorro API] Querying Ukrainian Prozorro for active tenders...")
-            prozorro_searcher = ProzorroSearcher()
-            prozorro_leads = prozorro_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            prozorro_leads = ProzorroSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(prozorro_leads)
             print(f"  [Prozorro API] Got {len(prozorro_leads)} relevant Ukrainian tenders")
-            _audit(
-                "tool_call",
-                f"Prozorro API returned {len(prozorro_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "prozorro", "count": len(prozorro_leads)},
-            )
+            _audit("tool_call", f"Prozorro API returned {len(prozorro_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "prozorro", "count": len(prozorro_leads)})
         except Exception as exc:
             print(f"  [Prozorro API] Failed: {exc}")
-            _audit(
-                "tool_call", f"Prozorro API failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"Prozorro API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # CanadaBuys — for Canada/North America/global queries
-    if detected_region in ("canada", "usa", "global"):
+    # CanadaBuys
+    if region_match("canada", "usa", "global") and src_on("canada_buys"):
         try:
             print("  [CanadaBuys API] Querying Canadian procurement data...")
-            canada_searcher = CanadaBuysSearcher()
-            canada_leads = canada_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            canada_leads = CanadaBuysSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(canada_leads)
             print(f"  [CanadaBuys API] Got {len(canada_leads)} relevant Canadian tenders")
-            _audit(
-                "tool_call",
-                f"CanadaBuys API returned {len(canada_leads)} leads",
-                node_name="discover",
-                status="success",
-                output_payload={"source": "canada_buys", "count": len(canada_leads)},
-            )
+            _audit("tool_call", f"CanadaBuys API returned {len(canada_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "canada_buys", "count": len(canada_leads)})
         except Exception as exc:
             print(f"  [CanadaBuys API] Failed: {exc}")
-            _audit(
-                "tool_call", f"CanadaBuys API failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"CanadaBuys API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # AusTender (Australia) — for Australia/global queries
-    if detected_region in ("australia", "global"):
+    # AusTender
+    if region_match("australia", "global") and src_on("austender"):
         try:
             print("  [AusTender API] Querying Australian federal tenders...")
-            aus_searcher = AusTenderSearcher()
-            aus_leads = aus_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            aus_leads = AusTenderSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(aus_leads)
             print(f"  [AusTender API] Got {len(aus_leads)} relevant Australian tenders")
-            _audit(
-                "tool_call",
-                f"AusTender API returned {len(aus_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "austender", "count": len(aus_leads)},
-            )
+            _audit("tool_call", f"AusTender API returned {len(aus_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "austender", "count": len(aus_leads)})
         except Exception as exc:
             print(f"  [AusTender API] Failed: {exc}")
-            _audit("tool_call", f"AusTender API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"AusTender API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # South Africa eTender — for Africa/global queries
-    if detected_region in ("africa", "global"):
+    # SA eTender
+    if region_match("africa", "global") and src_on("sa_etender"):
         try:
             print("  [SA eTender API] Querying South African government tenders...")
-            sa_searcher = SaEtenderSearcher()
-            sa_leads = sa_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            sa_leads = SaEtenderSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(sa_leads)
             print(f"  [SA eTender API] Got {len(sa_leads)} relevant South African tenders")
-            _audit(
-                "tool_call",
-                f"SA eTender API returned {len(sa_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "sa_etender", "count": len(sa_leads)},
-            )
+            _audit("tool_call", f"SA eTender API returned {len(sa_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "sa_etender", "count": len(sa_leads)})
         except Exception as exc:
             print(f"  [SA eTender API] Failed: {exc}")
-            _audit("tool_call", f"SA eTender API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"SA eTender API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Colombia SECOP — for South America/global queries
-    if detected_region in ("south_america", "global"):
+    # Colombia SECOP
+    if region_match("south_america", "global") and src_on("colombia_secop"):
         try:
             print("  [Colombia SECOP API] Querying Colombian procurement data...")
-            col_searcher = ColombiaSecopSearcher()
-            col_leads = col_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            col_leads = ColombiaSecopSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(col_leads)
             print(f"  [Colombia SECOP API] Got {len(col_leads)} relevant Colombian tenders")
-            _audit(
-                "tool_call",
-                f"Colombia SECOP API returned {len(col_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "colombia_secop", "count": len(col_leads)},
-            )
+            _audit("tool_call", f"Colombia SECOP API returned {len(col_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "colombia_secop", "count": len(col_leads)})
         except Exception as exc:
             print(f"  [Colombia SECOP API] Failed: {exc}")
-            _audit("tool_call", f"Colombia SECOP API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Colombia SECOP API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Brazil Compras — for South America/global queries
-    if detected_region in ("south_america", "global"):
+    # Brazil Compras
+    if region_match("south_america", "global") and src_on("brazil_compras"):
         try:
             print("  [Brazil Compras API] Querying Brazilian federal procurement...")
-            br_searcher = BrazilComprasSearcher()
-            br_leads = br_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            br_leads = BrazilComprasSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(br_leads)
             print(f"  [Brazil Compras API] Got {len(br_leads)} relevant Brazilian tenders")
-            _audit(
-                "tool_call",
-                f"Brazil Compras API returned {len(br_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "brazil_compras", "count": len(br_leads)},
-            )
+            _audit("tool_call", f"Brazil Compras API returned {len(br_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "brazil_compras", "count": len(br_leads)})
         except Exception as exc:
             print(f"  [Brazil Compras API] Failed: {exc}")
-            _audit("tool_call", f"Brazil Compras API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Brazil Compras API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Germany BKMS — for Europe/global queries
-    if detected_region in ("europe", "global"):
+    # Germany BKMS
+    if region_match("europe", "global") and src_on("germany_bkms"):
         try:
             print("  [Germany BKMS API] Querying German federal procurement...")
-            de_searcher = GermanyBkmsSearcher()
-            de_leads = de_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            de_leads = GermanyBkmsSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(de_leads)
             print(f"  [Germany BKMS API] Got {len(de_leads)} relevant German tenders")
-            _audit(
-                "tool_call",
-                f"Germany BKMS API returned {len(de_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "germany_bkms", "count": len(de_leads)},
-            )
+            _audit("tool_call", f"Germany BKMS API returned {len(de_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "germany_bkms", "count": len(de_leads)})
         except Exception as exc:
             print(f"  [Germany BKMS API] Failed: {exc}")
-            _audit("tool_call", f"Germany BKMS API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Germany BKMS API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Italy ANAC — for Europe/global queries
-    if detected_region in ("europe", "global"):
+    # Italy ANAC
+    if region_match("europe", "global") and src_on("italy_anac"):
         try:
             print("  [Italy ANAC API] Querying Italian public procurement...")
-            it_searcher = ItalyAnacSearcher()
-            it_leads = it_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            it_leads = ItalyAnacSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(it_leads)
             print(f"  [Italy ANAC API] Got {len(it_leads)} relevant Italian tenders")
-            _audit(
-                "tool_call",
-                f"Italy ANAC API returned {len(it_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "italy_anac", "count": len(it_leads)},
-            )
+            _audit("tool_call", f"Italy ANAC API returned {len(it_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "italy_anac", "count": len(it_leads)})
         except Exception as exc:
             print(f"  [Italy ANAC API] Failed: {exc}")
-            _audit("tool_call", f"Italy ANAC API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Italy ANAC API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Dominican Republic DGCP — for South America/Caribbean/global queries
-    if detected_region in ("south_america", "global"):
+    # Dominican DGCP
+    if region_match("south_america", "global") and src_on("dominican_dgcp"):
         try:
             print("  [Dominican DGCP API] Querying Dominican Republic procurement...")
-            dr_searcher = DominicanDgcpSearcher()
-            dr_leads = dr_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            dr_leads = DominicanDgcpSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(dr_leads)
             print(f"  [Dominican DGCP API] Got {len(dr_leads)} relevant Dominican tenders")
-            _audit(
-                "tool_call",
-                f"Dominican DGCP API returned {len(dr_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "dominican_dgcp", "count": len(dr_leads)},
-            )
+            _audit("tool_call", f"Dominican DGCP API returned {len(dr_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "dominican_dgcp", "count": len(dr_leads)})
         except Exception as exc:
             print(f"  [Dominican DGCP API] Failed: {exc}")
-            _audit("tool_call", f"Dominican DGCP API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Dominican DGCP API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Peru OECE — for South America/global queries
-    if detected_region in ("south_america", "global"):
+    # Peru OECE
+    if region_match("south_america", "global") and src_on("peru_oece"):
         try:
             print("  [Peru OECE API] Querying Peruvian procurement data...")
-            pe_searcher = PeruOeceSearcher()
-            pe_leads = pe_searcher.search(user_query=search_query, max_results=10, days_back=90)
+            pe_leads = PeruOeceSearcher().search(user_query=search_query, max_results=10, days_back=90)
             api_leads.extend(pe_leads)
             print(f"  [Peru OECE API] Got {len(pe_leads)} relevant Peruvian tenders")
-            _audit(
-                "tool_call",
-                f"Peru OECE API returned {len(pe_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "peru_oece", "count": len(pe_leads)},
-            )
+            _audit("tool_call", f"Peru OECE API returned {len(pe_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "peru_oece", "count": len(pe_leads)})
         except Exception as exc:
             print(f"  [Peru OECE API] Failed: {exc}")
-            _audit("tool_call", f"Peru OECE API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Peru OECE API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # World Bank Search API v2 — keyword-based, global (always fires alongside existing WB)
-    if detected_region in ("global", "india", "africa", "australia"):
+    # World Bank v2
+    if region_match("global", "india", "africa", "australia") and src_on("world_bank_v2"):
         try:
             print("  [WB Search v2 API] Querying World Bank procurement notices (keyword search)...")
-            wb2_searcher = WorldBankV2Searcher()
-            wb2_leads = wb2_searcher.search(user_query=search_query, max_results=10)
+            wb2_leads = WorldBankV2Searcher().search(user_query=search_query, max_results=10)
             api_leads.extend(wb2_leads)
             print(f"  [WB Search v2 API] Got {len(wb2_leads)} relevant World Bank tenders")
-            _audit(
-                "tool_call",
-                f"World Bank v2 API returned {len(wb2_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "world_bank_v2", "count": len(wb2_leads)},
-            )
+            _audit("tool_call", f"World Bank v2 API returned {len(wb2_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "world_bank_v2", "count": len(wb2_leads)})
         except Exception as exc:
             print(f"  [WB Search v2 API] Failed: {exc}")
-            _audit("tool_call", f"World Bank v2 API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"World Bank v2 API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Nigeria NOCOPO — for Africa/global queries
-    if detected_region in ("africa", "global"):
+    # Nigeria NOCOPO
+    if region_match("africa", "global") and src_on("nigeria_nocopo"):
         try:
             print("  [Nigeria NOCOPO API] Querying Nigerian federal procurement...")
-            ng_searcher = NigeriaNocopoSearcher()
-            ng_leads = ng_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            ng_leads = NigeriaNocopoSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(ng_leads)
             print(f"  [Nigeria NOCOPO API] Got {len(ng_leads)} relevant Nigerian tenders")
-            _audit(
-                "tool_call",
-                f"Nigeria NOCOPO API returned {len(ng_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "nigeria_nocopo", "count": len(ng_leads)},
-            )
+            _audit("tool_call", f"Nigeria NOCOPO API returned {len(ng_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "nigeria_nocopo", "count": len(ng_leads)})
         except Exception as exc:
             print(f"  [Nigeria NOCOPO API] Failed: {exc}")
-            _audit("tool_call", f"Nigeria NOCOPO API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Nigeria NOCOPO API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Kenya PPRA — for Africa/global queries
-    if detected_region in ("africa", "global"):
+    # Kenya PPRA
+    if region_match("africa", "global") and src_on("kenya_ppra"):
         try:
             print("  [Kenya PPRA API] Querying Kenyan government tenders...")
-            ke_searcher = KenyaPpraSearcher()
-            ke_leads = ke_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            ke_leads = KenyaPpraSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(ke_leads)
             print(f"  [Kenya PPRA API] Got {len(ke_leads)} relevant Kenyan tenders")
-            _audit(
-                "tool_call",
-                f"Kenya PPRA API returned {len(ke_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "kenya_ppra", "count": len(ke_leads)},
-            )
+            _audit("tool_call", f"Kenya PPRA API returned {len(ke_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "kenya_ppra", "count": len(ke_leads)})
         except Exception as exc:
             print(f"  [Kenya PPRA API] Failed: {exc}")
-            _audit("tool_call", f"Kenya PPRA API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Kenya PPRA API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Uganda GPP — for Africa/global queries
-    if detected_region in ("africa", "global"):
+    # Uganda GPP
+    if region_match("africa", "global") and src_on("uganda_gpp"):
         try:
             print("  [Uganda GPP API] Querying Ugandan government procurement...")
-            ug_searcher = UgandaGppSearcher()
-            ug_leads = ug_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            ug_leads = UgandaGppSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(ug_leads)
             print(f"  [Uganda GPP API] Got {len(ug_leads)} relevant Ugandan tenders")
-            _audit(
-                "tool_call",
-                f"Uganda GPP API returned {len(ug_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "uganda_gpp", "count": len(ug_leads)},
-            )
+            _audit("tool_call", f"Uganda GPP API returned {len(ug_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "uganda_gpp", "count": len(ug_leads)})
         except Exception as exc:
             print(f"  [Uganda GPP API] Failed: {exc}")
-            _audit("tool_call", f"Uganda GPP API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Uganda GPP API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    # Mexico City CDMX — for South America/global queries
-    if detected_region in ("south_america", "global"):
+    # Mexico City CDMX
+    if region_match("south_america", "global") and src_on("mexico_cdmx"):
         try:
             print("  [Mexico CDMX API] Querying Mexico City procurement data...")
-            mx_searcher = MexicoCdmxSearcher()
-            mx_leads = mx_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            mx_leads = MexicoCdmxSearcher().search(user_query=search_query, max_results=10, days_back=60)
             api_leads.extend(mx_leads)
             print(f"  [Mexico CDMX API] Got {len(mx_leads)} relevant Mexico City tenders")
-            _audit(
-                "tool_call",
-                f"Mexico CDMX API returned {len(mx_leads)} leads",
-                node_name="discover", status="success",
-                output_payload={"source": "mexico_cdmx", "count": len(mx_leads)},
-            )
+            _audit("tool_call", f"Mexico CDMX API returned {len(mx_leads)} leads",
+                   node_name="discover", status="success",
+                   output_payload={"source": "mexico_cdmx", "count": len(mx_leads)})
         except Exception as exc:
             print(f"  [Mexico CDMX API] Failed: {exc}")
-            _audit("tool_call", f"Mexico CDMX API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+            _audit("tool_call", f"Mexico CDMX API failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
 
-    print(f"  API total: {len(api_leads)} raw leads from direct government APIs")
+    api_raw_count = len(api_leads)
+    print(f"  API total: {api_raw_count} raw leads from direct government APIs")
 
     # ------------------------------------------------------------------
-    # Step 2: Strict deadline filter on API results
-    # Every API result must have a verified future deadline.
+    # Step 2: Strict deadline filter (Layer 1 of three).
     # ------------------------------------------------------------------
     api_verified = _strict_deadline_filter(api_leads, "API")
+    blocked_expired = api_raw_count - len(api_verified)
 
-    # Deduplicate by URL
+    # Dedup by URL within the API set.
     seen_urls: set[str] = set()
     valid_leads: list = []
+    duplicates_in_api = 0
     for lead in api_verified:
-        url = getattr(lead, 'source_url', '')
-        if url and url not in seen_urls:
+        url = getattr(lead, "source_url", "")
+        if url and url in seen_urls:
+            duplicates_in_api += 1
+            continue
+        if url:
             seen_urls.add(url)
-            if not hasattr(lead, '_effective_score'):
-                lead._effective_score = getattr(lead, 'relevance_score', 0.80)
-            valid_leads.append(lead)
-
+        if not hasattr(lead, "_effective_score"):
+            lead._effective_score = getattr(lead, "relevance_score", 0.80)
+        valid_leads.append(lead)
     print(f"  API after deadline filter + dedup: {len(valid_leads)} verified leads")
 
     # ------------------------------------------------------------------
-    # Step 2b: Relevance floor — block tenders without real SDS/EHS signal.
-    # A 15% score means only generic partial matches like "safety" or
-    # "waste" — not actually about chemical safety or SDS. Require 30%+
-    # which means at least 1 strong keyword or 6+ partial matches.
+    # Step 2b: Relevance floor — user's pick OR 30% absolute, whichever larger.
     # ------------------------------------------------------------------
-    RELEVANCE_FLOOR = 0.30
     before_relevance = len(valid_leads)
     valid_leads = [
         l for l in valid_leads
-        if getattr(l, 'relevance_score', 0) >= RELEVANCE_FLOOR
+        if getattr(l, "relevance_score", 0) >= relevance_floor
     ]
-    blocked_irrelevant = before_relevance - len(valid_leads)
-    if blocked_irrelevant > 0:
-        print(f"  [Relevance gate] Blocked {blocked_irrelevant} leads below {RELEVANCE_FLOOR:.0%} "
+    blocked_relevance = before_relevance - len(valid_leads)
+    if blocked_relevance > 0:
+        print(f"  [Relevance gate] Blocked {blocked_relevance} leads below {relevance_floor:.0%} "
               f"(kept {len(valid_leads)} relevant)")
     else:
-        print(f"  [Relevance gate] All {len(valid_leads)} leads above {RELEVANCE_FLOOR:.0%} floor")
+        print(f"  [Relevance gate] All {len(valid_leads)} leads above {relevance_floor:.0%} floor")
 
     # ------------------------------------------------------------------
-    # Step 3: SERP automatic fallback (ONLY if APIs returned zero results)
+    # Step 3: SERP automatic fallback — only when APIs returned 0 AND
+    # the user opted in via filters["includeSerpFallback"].
     # ------------------------------------------------------------------
     serp_used = False
-    serp_valid_leads: list = []
-
-    if len(valid_leads) == 0:
+    if len(valid_leads) == 0 and include_serp:
         serp_used = True
         print(f"\n  [SERP FALLBACK] APIs returned 0 results — falling back to Google SERP...")
-        _audit(
-            "tool_call",
-            f"API sources returned 0 results, falling back to SERP for: {search_query[:100]}",
-            node_name="discover",
-            input_payload={"query": search_query, "tool": "brightdata_serp", "mode": "auto_fallback"},
-        )
+        _audit("tool_call",
+               f"API sources returned 0 results, falling back to SERP for: {search_query[:100]}",
+               node_name="discover",
+               input_payload={"query": search_query, "tool": "brightdata_serp", "mode": "auto_fallback"})
         try:
-            searcher = SerpTenderSearcher()
-            serp_leads = searcher.search(user_query=search_query)
+            serp_leads = SerpTenderSearcher().search(user_query=search_query)
             print(f"  [SERP] Got {len(serp_leads)} raw leads — running strict pipeline...")
-
-            # Run the strict filtering pipeline (every result page-fetched)
-            serp_valid_leads = _filter_serp_leads(serp_leads, search_query)
-            print(f"  [SERP] {len(serp_valid_leads)} passed (all have verified deadlines)")
-
-            # Add SERP leads to valid_leads (no dedup needed — API list was empty)
-            for lead in serp_valid_leads:
-                url = getattr(lead, 'source_url', '')
-                if url and url not in seen_urls:
+            serp_valid = _filter_serp_leads(serp_leads, search_query)
+            print(f"  [SERP] {len(serp_valid)} passed (all have verified deadlines)")
+            for lead in serp_valid:
+                if getattr(lead, "relevance_score", 0) < relevance_floor:
+                    blocked_relevance += 1
+                    continue
+                url = getattr(lead, "source_url", "")
+                if url and url in seen_urls:
+                    continue
+                if url:
                     seen_urls.add(url)
-                    valid_leads.append(lead)
-
+                valid_leads.append(lead)
         except Exception as exc:
             print(f"  [SERP] Failed: {exc}")
-            _audit(
-                "tool_call", f"SERP fallback failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
+            _audit("tool_call", f"SERP fallback failed: {exc}",
+                   node_name="discover", status="failure", error_message=str(exc))
+    elif len(valid_leads) == 0:
+        print("  [SERP] Skipped — APIs returned 0 results but includeSerpFallback=False")
     else:
         print("  [SERP] Skipped — APIs returned results, no fallback needed")
 
     valid_leads.sort(
-        key=lambda l: getattr(l, '_effective_score', getattr(l, 'relevance_score', 0)),
+        key=lambda l: getattr(l, "_effective_score", getattr(l, "relevance_score", 0)),
         reverse=True,
     )
 
-    _all_api_portals = ('ted.europa.eu', 'sam.gov', 'uk_gov', 'boamp', 'world_bank', 'prozorro', 'canada_buys', 'austender', 'sa_etender', 'colombia_secop', 'brazil_compras', 'germany_bkms', 'italy_anac', 'dominican_dgcp', 'peru_oece', 'world_bank_v2', 'nigeria_nocopo', 'kenya_ppra', 'uganda_gpp', 'mexico_cdmx')
-    api_count = len([l for l in valid_leads if getattr(l, 'source_portal', '') in _all_api_portals])
-    serp_count = len(valid_leads) - api_count
-
-    print(f"  FINAL: {len(valid_leads)} total ({api_count} API + {serp_count} SERP)")
-
-    if not valid_leads:
-        from src.discovery.serp_search import detect_region, REGION_COUNTRY_NAMES
-        detected = detect_region(query)
-        region_name = REGION_COUNTRY_NAMES.get(detected, ["this region"])[0]
-
-        searched_label = "20 government APIs + Google SERP" if serp_used else "20 government APIs"
-
-        if detected != "global":
-            reply = (
-                f"**No active SDS/EHS tenders found in {region_name}.**\n\n"
-                f"I searched {searched_label} but couldn't find relevant, "
-                f"unexpired opportunities matching your criteria in {region_name} right now.\n\n"
-                f"**What you can do:**\n"
-                f"- Try broadening your search: *'find chemical safety tenders globally'*\n"
-                f"- Check region-specific portals directly (e.g., AusTender, TED Europa, SAM.gov)\n"
-                f"- Try different keywords: *'EHS compliance software'*, *'hazardous materials management'*"
-            )
-        else:
-            reply = (
-                "**No matching tenders found.**\n\n"
-                f"I searched {searched_label} globally but couldn't find verified, unexpired "
-                "tender listings matching your criteria.\n\n"
-                "**Try:**\n"
-                "- *'SDS authoring software RFP United States'*\n"
-                "- *'chemical safety compliance tender Europe'*\n"
-                "- *'EHS management system procurement Canada'*"
-            )
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        return reply, {
-            "node": "discover",
-            "tenders_found": 0,
-            "duration_ms": duration_ms,
-            "cost_usd": 0,
-            "serp_fallback_used": serp_used,
-        }
-
-    # Step 3: Format each tender as a rich card with source badges
-    import re
-
-    # Source badge mapping — users see exactly where each tender came from
-    SOURCE_BADGES = {
-        "ted.europa.eu":   "\U0001f1ea\U0001f1fa TED Europa",
-        "uk_gov":          "\U0001f1ec\U0001f1e7 UK Gov",
-        "sam.gov":         "\U0001f1fa\U0001f1f8 SAM.gov",
-        "boamp":           "\U0001f1eb\U0001f1f7 BOAMP France",
-        "world_bank":      "\U0001f30d World Bank",
-        "prozorro":        "\U0001f1fa\U0001f1e6 Prozorro",
-        "canada_buys":     "\U0001f1e8\U0001f1e6 CanadaBuys",
-        "austender":       "\U0001f1e6\U0001f1fa AusTender",
-        "sa_etender":      "\U0001f1ff\U0001f1e6 SA eTender",
-        "colombia_secop":  "\U0001f1e8\U0001f1f4 SECOP Colombia",
-        "brazil_compras":  "\U0001f1e7\U0001f1f7 Compras Brazil",
-        "germany_bkms":    "\U0001f1e9\U0001f1ea BKMS Germany",
-        "italy_anac":      "\U0001f1ee\U0001f1f9 ANAC Italy",
-        "dominican_dgcp":  "\U0001f1e9\U0001f1f4 DGCP Dom. Rep.",
-        "peru_oece":       "\U0001f1f5\U0001f1ea OECE Peru",
-        "world_bank_v2":   "\U0001f30d World Bank v2",
-        "nigeria_nocopo":  "\U0001f1f3\U0001f1ec NOCOPO Nigeria",
-        "kenya_ppra":      "\U0001f1f0\U0001f1ea PPRA Kenya",
-        "uganda_gpp":      "\U0001f1fa\U0001f1ec GPP Uganda",
-        "mexico_cdmx":     "\U0001f1f2\U0001f1fd CDMX Mexico",
-    }
-
-    # ---------------------------------------------------------------
-    # FINAL SAFETY NET: Re-verify every deadline right before display.
-    # Belt-and-suspenders — if anything slipped past earlier filters,
-    # this catches it. Zero expired tenders shown. Period.
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 4: FINAL SAFETY NET — re-verify every deadline right before we
+    # serialize the output. If anything slipped past earlier filters, this
+    # catches it. Zero expired tenders ever reach the AMS.
+    # ------------------------------------------------------------------
     from dateutil import parser as dateparser
-    _today_final = datetime.now(timezone.utc).date()
-    _display_leads: list = []
-    for _lead in valid_leads:
-        _dl = getattr(_lead, 'submission_deadline', '') or ''
-        if not _dl or len(_dl) < 8:
-            print(f"  [SAFETY NET] Blocked (no deadline): {getattr(_lead, 'title', '?')[:60]}")
+    today_final = datetime.now(timezone.utc).date()
+    safety_net_leads: list = []
+    safety_net_blocked = 0
+    for lead in valid_leads:
+        dl = getattr(lead, "submission_deadline", "") or ""
+        if not dl or len(dl) < 8:
+            safety_net_blocked += 1
             continue
         try:
-            _parsed = dateparser.parse(_dl).date()
-            if _parsed < _today_final:
-                print(f"  [SAFETY NET] Blocked (expired {_dl}): {getattr(_lead, 'title', '?')[:60]}")
+            parsed = dateparser.parse(dl).date()
+            if parsed < today_final:
+                safety_net_blocked += 1
                 continue
         except Exception:
-            print(f"  [SAFETY NET] Blocked (unparseable '{_dl}'): {getattr(_lead, 'title', '?')[:60]}")
+            safety_net_blocked += 1
             continue
-        _display_leads.append(_lead)
-    if len(_display_leads) < len(valid_leads):
-        print(f"  [SAFETY NET] Removed {len(valid_leads) - len(_display_leads)} leads at final check")
-    valid_leads = _display_leads
+        safety_net_leads.append(lead)
+    if safety_net_blocked > 0:
+        print(f"  [SAFETY NET] Removed {safety_net_blocked} leads at final check")
+        blocked_expired += safety_net_blocked
+    valid_leads = safety_net_leads
 
-    formatted_items = []
-    for i, lead in enumerate(valid_leads[:10], 1):
-        title = lead.title.strip()
-        if len(title) > 80:
-            title = title[:77] + "..."
-        url = lead.source_url
-        agency = getattr(lead, 'agency', 'Unknown')
-        relevance = lead.relevance_score
-        deadline = getattr(lead, 'submission_deadline', '') or ''
-        portal = getattr(lead, 'source_portal', '')
+    # ------------------------------------------------------------------
+    # Step 5: Post-filters from the form — deadline window, value range,
+    # postedWithinDays. Applied AFTER all gates.
+    # ------------------------------------------------------------------
+    deadline_from = _parse_iso_date(filters.get("deadlineFrom"))
+    deadline_to = _parse_iso_date(filters.get("deadlineTo"))
+    min_value = filters.get("minValueUsd")
+    max_value = filters.get("maxValueUsd")
+    posted_within_days = filters.get("postedWithinDays")
+    today_d = datetime.now(timezone.utc).date()
 
-        # Source badge
-        source_badge = SOURCE_BADGES.get(portal, "\U0001f50d SERP")
+    post_filter_blocked = 0
+    after_post: list = []
+    for lead in valid_leads:
+        dl = _parse_iso_date(getattr(lead, "submission_deadline", ""))
+        if deadline_from and dl and dl < deadline_from:
+            post_filter_blocked += 1
+            continue
+        if deadline_to and dl and dl > deadline_to:
+            post_filter_blocked += 1
+            continue
+        val = getattr(lead, "value_amount", None) or 0
+        if (min_value is not None or max_value is not None) and not val:
+            # Spec: skip leads without a contract value when a value filter is set.
+            post_filter_blocked += 1
+            continue
+        if min_value is not None and val and float(val) < float(min_value):
+            post_filter_blocked += 1
+            continue
+        if max_value is not None and val and float(val) > float(max_value):
+            post_filter_blocked += 1
+            continue
+        if posted_within_days and str(posted_within_days).lower() != "all":
+            try:
+                window = int(posted_within_days)
+                posted = _parse_iso_date(getattr(lead, "posted_date", ""))
+                if posted:
+                    delta_days = (today_d - posted).days
+                    if delta_days > window:
+                        post_filter_blocked += 1
+                        continue
+            except (ValueError, TypeError):
+                pass
+        after_post.append(lead)
+    if post_filter_blocked > 0:
+        print(f"  [POST FILTER] Dropped {post_filter_blocked} leads outside form bounds")
+    valid_leads = after_post
 
-        # Clean the description
-        desc = getattr(lead, 'description', '') or ''
-        desc = re.sub(r'https?://\S+', '', desc)
-        desc = re.sub(r'[\w.-]+\s*›[^›\n]*(?:›[^›\n]*)*', '', desc)
-        desc = re.sub(r'\s{2,}', ' ', desc).strip()
-        if desc.lower().strip('.') == title.lower().strip('.'):
-            desc = ''
-        if len(desc) > 200:
-            desc = desc[:197] + "..."
+    # ------------------------------------------------------------------
+    # Step 6: Serialize to DiscoveredTender payloads. The HTTP push step
+    # in main_loop() handles fingerprint-based dedup against the DB.
+    # ------------------------------------------------------------------
+    tenders: list[dict] = []
+    seen_fingerprints: set[str] = set()
+    in_batch_dupes = 0
+    for lead in valid_leads:
+        td = _lead_to_tender(lead, search_query)
+        if td is None:
+            continue
+        fp = td["fingerprint"]
+        if fp in seen_fingerprints:
+            in_batch_dupes += 1
+            continue
+        seen_fingerprints.add(fp)
+        tenders.append(td)
 
-        # Value (if available from UK or SAM APIs)
-        value_str = ""
-        value_amount = getattr(lead, 'value_amount', 0) or 0
-        if value_amount > 0:
-            currency = getattr(lead, 'value_currency', 'GBP')
-            if value_amount >= 1_000_000:
-                value_str = f" · \U0001f4b0 {currency} {value_amount/1_000_000:.1f}M"
-            elif value_amount >= 1_000:
-                value_str = f" · \U0001f4b0 {currency} {value_amount/1_000:.0f}K"
-
-        # Build the card
-        card = f"**{i}. [{title}]({url})**"
-        card += f"\n{source_badge} · \U0001f3db️ {agency}"
-        if desc:
-            card += f"\n{desc}"
-        badge_line = f"\U0001f4ca Relevance: {relevance:.0%}"
-        badge_line += f" · \U0001f4c5 Deadline: {deadline[:10]}"
-        badge_line += value_str
-        card += f"\n{badge_line}"
-
-        formatted_items.append(card)
-
-    results_block = "\n\n".join(formatted_items)
-    # Also build a plain text version for the LLM summary
-    plain_list = "\n".join(
-        f"{i}. {l.title} ({getattr(l, 'agency', 'Unknown')}) - {l.relevance_score:.0%}"
-        for i, l in enumerate(valid_leads[:10], 1)
-    )
-
-    # Step 4: Get LLM summary
-    llm_summary = ""
-    llm_cost = 0.0
-    llm_tokens_in = 0
-    llm_tokens_out = 0
-    if OPENROUTER_API_KEY:
-        try:
-            llm_result = call_llm(
-                f"The user searched for: '{query}'\n\n"
-                f"Found {len(valid_leads)} verified tender listings:\n{plain_list}\n\n"
-                f"Write a 3-4 sentence executive briefing. Name the top opportunity, "
-                f"its issuing agency, region, estimated contract value if visible, "
-                f"and a clear recommendation on whether to pursue it. Be specific and actionable.",
-                max_tokens=350,
-            )
-            llm_summary = llm_result["content"]
-            llm_cost = llm_result["cost_usd"]
-            llm_tokens_in = llm_result["tokens_input"]
-            llm_tokens_out = llm_result["tokens_output"]
-        except Exception as exc:
-            print(f"LLM summary failed: {exc}")
-
-    # Step 5: Assemble clean reply
     duration_ms = int((time.perf_counter() - start_time) * 1000)
+    print(f"  FINAL: {len(tenders)} tenders | "
+          f"blockedExpired={blocked_expired} blockedRelevance={blocked_relevance} "
+          f"deduped={duplicates_in_api + in_batch_dupes} | {duration_ms}ms")
 
-    parts = []
-    parts.append("## \U0001f50d Tender Discovery Results")
-    parts.append("")
-    if llm_summary:
-        parts.append(llm_summary)
-        parts.append("")
-        parts.append("---")
-        parts.append("")
-    parts.append(f"**{len(valid_leads)} verified tenders found:**")
-    parts.append("")
-    parts.append(results_block)
-    parts.append("")
-    parts.append("---")
-    parts.append("")
-    # Build a source label reflecting which sources contributed
-    source_parts = []
-    api_portals = _all_api_portals
-    api_final = len([l for l in valid_leads if getattr(l, 'source_portal', '') in api_portals])
-    serp_final = len(valid_leads) - api_final
-    if api_final > 0:
-        source_parts.append(f"{api_final} from government APIs")
-    if serp_final > 0:
-        source_parts.append(f"{serp_final} from SERP fallback")
-    source_label = " + ".join(source_parts) if source_parts else "government API search"
-
-    parts.append(f"_{source_label} \u2022 {len(valid_leads)} verified results \u2022 all deadlines confirmed active \u2022 {duration_ms}ms_")
-
-    reply = "\n".join(parts)
-
-    # Determine which sources contributed
-    sources_used = []
-    portal_to_source = {
-        "ted.europa.eu": "ted_europa",
-        "uk_gov": "uk_gov",
-        "sam.gov": "sam_gov",
-        "boamp": "boamp_france",
-        "world_bank": "world_bank",
-        "prozorro": "prozorro",
-        "canada_buys": "canada_buys",
-        "austender": "austender",
-        "sa_etender": "sa_etender",
-        "colombia_secop": "colombia_secop",
-        "brazil_compras": "brazil_compras",
-        "germany_bkms": "germany_bkms",
-        "italy_anac": "italy_anac",
-        "dominican_dgcp": "dominican_dgcp",
-        "peru_oece": "peru_oece",
-        "world_bank_v2": "world_bank_v2",
-        "nigeria_nocopo": "nigeria_nocopo",
-        "kenya_ppra": "kenya_ppra",
-        "uganda_gpp": "uganda_gpp",
-        "mexico_cdmx": "mexico_cdmx",
-    }
-    for portal_key, source_name in portal_to_source.items():
-        if any(getattr(l, 'source_portal', '') == portal_key for l in valid_leads):
-            sources_used.append(source_name)
-    if serp_final > 0:
-        sources_used.append("brightdata_serp")
-
-    metadata = {
-        "node": "discover",
-        "tenders_found": len(valid_leads),
-        "top_relevance": valid_leads[0].relevance_score if valid_leads else 0,
-        "tokens_input": llm_tokens_in,
-        "tokens_output": llm_tokens_out,
-        "cost_usd": llm_cost,
-        "model": LLM_MODEL,
-        "duration_ms": duration_ms,
-        "search_sources": sources_used,
-        "api_results": api_final,
-        "serp_results": serp_final,
-        "serp_fallback_used": serp_used,
-        "all_deadlines_verified": True,
+    return {
+        "tenders": tenders,
+        "stats": {
+            "totalFound": len(tenders),
+            "blockedExpired": blocked_expired,
+            "blockedRelevance": blocked_relevance,
+            "deduplicated": duplicates_in_api + in_batch_dupes,
+            "serpFallbackUsed": serp_used,
+            "durationMs": duration_ms,
+        },
     }
 
-    return reply, metadata
-
 
 # ---------------------------------------------------------------------------
-# Message Handler — processes incoming chat messages from AMS
+# Form Filling — triggered by fill_form AgentTask (no chat)
 # ---------------------------------------------------------------------------
 
-def classify_intent(user_message: str, has_attachments: bool = False) -> dict:
-    """Use the LLM to understand what the user wants.
+def handle_fill_form_task(client: NexusClient, task: dict) -> None:
+    """Process a fill_form task created by a TenderPursuit Agent fill mode.
 
-    Returns:
-        {
-            "intent": "search_tenders" | "ask_question" | "greeting" | "refine_results" | "fill_form",
-            "search_query": "extracted search terms if intent is search",
-            "response_hint": "brief note on how to respond",
-        }
+    The task carries (via metadata):
+      - pursuitId: the TenderPursuit row to update on completion
+      - formFileKey: MinIO key of the uploaded tender form
+      - formFilename: original filename for the user-facing label
+      - tenderTitle / tenderUrl: surface context for the Approval card
+
+    Single-shot fill (no clarification round trips since chat is removed).
+    Low-confidence fields are flagged in the submission metadata for human
+    review; the operator approves or rejects in /approvals.
     """
-    attachment_hint = ""
-    if has_attachments:
-        attachment_hint = "\nIMPORTANT: The user has attached one or more files to this message. If the message is about filling, completing, or submitting a form/tender/document, the intent is 'fill_form'."
-
-    try:
-        result = call_llm(
-            f"""You are an intent classifier for a tender discovery agent.
-Analyze this user message and respond with ONLY valid JSON (no markdown, no explanation):
-
-User message: "{user_message}"{attachment_hint}
-
-Respond with this exact JSON structure:
-{{"intent": "search_tenders|ask_question|greeting|refine_results|fill_form", "search_query": "extracted search keywords for tender search", "response_hint": "brief note"}}
-
-Rules:
-- "fill_form": user wants to fill out, complete, submit a tender form, or has uploaded a document to be filled
-- "search_tenders": user wants to find tenders, RFPs, bids, procurement opportunities
-- "ask_question": user asks about a specific tender, process, or general question
-- "greeting": user says hi, hello, thanks, etc.
-- "refine_results": user wants to narrow down or filter previous results
-- "search_query": extract the core topic/keywords (e.g., "chemical safety tenders in Europe")
-- Always extract a search_query even for greetings (use "SDS management tenders" as default)""",
-            max_tokens=200,
-        )
-        # Parse JSON from response
-        content = result["content"].strip()
-        # Handle markdown code blocks
-        if "```" in content:
-            content = content.split("```")[1].strip()
-            if content.startswith("json"):
-                content = content[4:].strip()
-        return json.loads(content)
-    except Exception as exc:
-        print(f"Intent classification failed: {exc}, defaulting to search")
-        # If there are attachments, default to fill_form
-        if has_attachments:
-            return {
-                "intent": "fill_form",
-                "search_query": user_message,
-                "response_hint": "form filling with attachment",
-            }
-        return {
-            "intent": "search_tenders",
-            "search_query": user_message,
-            "response_hint": "default search",
-        }
-
-
-# ---------------------------------------------------------------------------
-# Form Filling — Conversation State & Pipeline
-# ---------------------------------------------------------------------------
-
-# In-memory state for multi-turn form-filling conversations.
-# Keyed by thread_id. Each entry tracks the form-filling progress.
-_form_sessions: dict[str, dict] = {}
-
-
-def handle_form_filling(client: NexusClient, message: dict) -> None:
-    """Handle the form-filling flow (multi-turn).
-
-    Flow:
-    1. User uploads form + says "fill this" → parse form, fill what we can, ask questions
-    2. User answers clarification questions → fill remaining fields, generate file, send back
-    """
-    thread_id = message.get("threadId", "")
-    content = message.get("content", "")
-    attachments = message.get("attachments", [])
-    clean_content = content.replace("@tender-agent", "").strip()
-
     start_time = time.perf_counter()
+    metadata = task.get("metadata") or {}
+    pursuit_id = metadata.get("pursuitId")
+    form_file_key = metadata.get("formFileKey")
+    form_filename = metadata.get("formFilename") or "tender_form"
+    tender_title = metadata.get("tenderTitle") or "Tender"
+    task_id = task.get("id")
 
-    # Check if this is a continuation of an existing form-filling session
-    session = _form_sessions.get(thread_id)
-
-    if session and session.get("waiting_for_answers"):
-        # This is a follow-up message with answers to our questions
-        print("Processing user answers for form filling...")
-        _handle_form_answers(client, thread_id, clean_content, session)
+    if not form_file_key:
+        msg = "fill_form task is missing metadata.formFileKey"
+        print(f"  [fill_form] ERROR: {msg}")
+        _audit("task_failed", msg, status="failure",
+               input_payload={"task_id": task_id}, error_message=msg)
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg, duration_ms=0)
         return
 
-    # New form-filling request — needs at least one attachment
-    if not attachments:
-        client.reply(
-            thread_id=thread_id,
-            content=(
-                "I'd be happy to help fill out a tender form! Please **attach the form file** "
-                "(PDF, DOCX, or XLSX) to your message, and I'll analyze it and fill in what I can "
-                "using your company documents.\n\n"
-                "You can drag & drop the file or click the paperclip icon."
-            ),
-            metadata={"intent": "fill_form", "status": "awaiting_attachment"},
-        )
-        return
-
-    # Download the first attachment
-    att = attachments[0]
-    minio_key = att.get("minioKey", "")
-    filename = att.get("filename", "form")
-
-    if not minio_key:
-        client.reply(
-            thread_id=thread_id,
-            content="I couldn't access the attached file. Could you try uploading it again?",
-            metadata={"intent": "fill_form", "status": "error"},
-        )
-        return
-
-    print(f"Downloading form: {filename} ({minio_key})")
-
-    # Create a temp directory for this session
     tmp_dir = tempfile.mkdtemp(prefix="tender_form_")
-    local_path = os.path.join(tmp_dir, filename)
+    local_path = os.path.join(tmp_dir, form_filename)
 
     try:
-        # Download the form from AMS
-        client.download_file(minio_key, local_path)
-        print(f"Downloaded to: {local_path}")
+        print(f"  [fill_form] Downloading {form_file_key}")
+        client.download_file(form_file_key, local_path)
 
-        # Parse the form
-        print("Parsing form fields...")
-        parser = FormParser()
-        parse_result = parser.parse(local_path)
-        print(f"Found {len(parse_result.fields)} fields, format: {parse_result.file_format.value}")
-
-        # Audit: form parsed
-        _audit(
-            "form_parsed",
-            f"Parsed {filename}: {len(parse_result.fields)} fields, format={parse_result.file_format.value}",
-            node_name="fill_form",
-            input_payload={"filename": filename, "format": parse_result.file_format.value},
-            output_payload={
-                "fields_count": len(parse_result.fields),
-                "field_names": [f.name for f in parse_result.fields[:20]],
-                "parse_errors": parse_result.parse_errors,
-                "raw_text_length": len(parse_result.raw_text),
-            },
-        )
-
-        if parse_result.parse_errors:
-            for err in parse_result.parse_errors:
-                print(f"  Parse warning: {err}")
+        parse_result = FormParser().parse(local_path)
+        print(f"  [fill_form] Parsed {len(parse_result.fields)} fields "
+              f"({parse_result.file_format.value})")
+        _audit("form_parsed",
+               f"Parsed {form_filename}: {len(parse_result.fields)} fields",
+               node_name="fill_form",
+               input_payload={"filename": form_filename, "task_id": task_id},
+               output_payload={
+                   "fields_count": len(parse_result.fields),
+                   "field_names": [f.name for f in parse_result.fields[:20]],
+                   "parse_errors": parse_result.parse_errors,
+               })
 
         if not parse_result.fields and not parse_result.raw_text:
-            client.reply(
-                thread_id=thread_id,
-                content=(
-                    f"I opened **{filename}** but couldn't extract any form fields from it. "
-                    f"The file might be a scanned image or an unsupported format.\n\n"
-                    f"I can work with fillable PDFs, Word documents (.docx) with tables or "
-                    f"placeholders, and Excel spreadsheets (.xlsx)."
-                ),
-                metadata={"intent": "fill_form", "status": "parse_failed"},
-            )
+            msg = f"Could not extract any fields from {form_filename}"
+            complete_agent_task(client, task_id, status="failed",
+                                result_summary=msg, duration_ms=0)
+            mark_pursuit_status(client, pursuit_id, "backlog",
+                                notes=f"Auto-revert: {msg}")
             return
 
-        # Fetch company context documents
         company_context = fetch_agent_context()
         if not company_context:
-            client.reply(
-                thread_id=thread_id,
-                content=(
-                    f"I've analyzed **{filename}** and found **{len(parse_result.fields)} fields** "
-                    f"to fill. However, I don't have any company documents assigned to me yet.\n\n"
-                    f"Please go to the **Documents** page in the AMS, upload your company details "
-                    f"(ABN, address, certifications, past proposals, etc.), and assign them to the "
-                    f"Tender Agent. Then try again!"
-                ),
-                metadata={"intent": "fill_form", "status": "no_context"},
-            )
+            msg = ("No company documents assigned to the tender-agent. "
+                   "Upload context docs in Documents → assign to Tender Agent.")
+            complete_agent_task(client, task_id, status="failed",
+                                result_summary=msg, duration_ms=0)
+            mark_pursuit_status(client, pursuit_id, "backlog",
+                                notes=f"Auto-revert: {msg}")
             return
 
-        # Fill the form using LLM + context
-        print("Filling form with company context...")
-        filler = FormFiller(
-            llm_call_fn=call_llm,
-            confidence_threshold=0.7,
-        )
+        filler = FormFiller(llm_call_fn=call_llm, confidence_threshold=0.7)
         fill_result = filler.fill(parse_result, company_context)
-
-        print(f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields")
-        print(f"Questions for user: {fill_result.needs_clarification_count}")
-
-        # Audit: form filling result
-        _audit(
-            "form_filled",
-            f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields, "
-            f"{fill_result.needs_clarification_count} need user input",
-            node_name="fill_form",
-            cost_usd=fill_result.llm_cost_usd,
-            output_payload={
-                "filled_count": fill_result.filled_count,
-                "total_fields": fill_result.total_fields,
-                "needs_clarification": fill_result.needs_clarification_count,
-                "filled_field_names": [f.name for f in fill_result.filled_fields],
-                "question_fields": [q.field_name for q in fill_result.questions],
-            },
-        )
-
-        # Store session state for multi-turn
-        _form_sessions[thread_id] = {
-            "tmp_dir": tmp_dir,
-            "local_path": local_path,
-            "filename": filename,
-            "parse_result": parse_result,
-            "fill_result": fill_result,
-            "company_context": company_context,
-            "waiting_for_answers": fill_result.needs_clarification_count > 0,
-        }
+        print(f"  [fill_form] Filled {fill_result.filled_count}/{fill_result.total_fields}, "
+              f"{fill_result.needs_clarification_count} low-confidence flagged")
+        _audit("form_filled",
+               f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields, "
+               f"{fill_result.needs_clarification_count} need review",
+               node_name="fill_form",
+               cost_usd=fill_result.llm_cost_usd,
+               output_payload={
+                   "filled_count": fill_result.filled_count,
+                   "total_fields": fill_result.total_fields,
+                   "low_confidence_count": fill_result.needs_clarification_count,
+                   "filled_field_names": [f.name for f in fill_result.filled_fields],
+               })
 
         duration_ms = int((time.perf_counter() - start_time) * 1000)
+        _submit_filled_form(
+            client,
+            task_id=task_id,
+            pursuit_id=pursuit_id,
+            tmp_dir=tmp_dir,
+            local_path=local_path,
+            original_filename=form_filename,
+            tender_title=tender_title,
+            fill_result=fill_result,
+            duration_ms=duration_ms,
+        )
 
-        if fill_result.needs_clarification_count > 0:
-            # Ask user about uncertain fields
-            questions_text = _format_questions(fill_result)
-            reply = (
-                f"## \U0001f4cb Form Analysis: {filename}\n\n"
-                f"I've analyzed the form and filled **{fill_result.filled_count}** out of "
-                f"**{fill_result.total_fields}** fields using your company documents.\n\n"
-                f"I need your help with **{fill_result.needs_clarification_count}** field(s):\n\n"
-                f"{questions_text}\n\n"
-                f"---\n"
-                f"_Please reply with the answers and I'll generate the completed form._"
-            )
-            client.reply(
-                thread_id=thread_id,
-                content=reply,
-                metadata={
-                    "intent": "fill_form",
-                    "status": "awaiting_answers",
-                    "fields_total": fill_result.total_fields,
-                    "fields_filled": fill_result.filled_count,
-                    "fields_pending": fill_result.needs_clarification_count,
-                    "duration_ms": duration_ms,
-                },
-            )
-        else:
-            # All fields filled — generate the completed form immediately
-            _generate_and_send_form(client, thread_id, _form_sessions[thread_id], duration_ms)
-
-        # Track metrics
         client.track("task_completion", 1.0, metadata={
             "node": "fill_form",
             "fields_filled": fill_result.filled_count,
             "fields_total": fill_result.total_fields,
+            "pursuit_id": pursuit_id,
         })
         client.track("latency", float(duration_ms), metadata={"node": "fill_form"})
         if fill_result.llm_cost_usd > 0:
-            client.track("cost", fill_result.llm_cost_usd, metadata={
-                "node": "fill_form", "model": LLM_MODEL,
-            })
+            client.track("cost", fill_result.llm_cost_usd,
+                         metadata={"node": "fill_form", "model": LLM_MODEL})
 
     except Exception as exc:
-        error_msg = f"Error processing form: {str(exc)}"
-        print(f"ERROR: {error_msg}")
         traceback.print_exc()
-        client.reply(
-            thread_id=thread_id,
-            content=(
-                f"Sorry, I ran into an issue while processing **{filename}**:\n\n"
-                f"`{str(exc)}`\n\n"
-                f"Please make sure the file is a valid PDF, DOCX, or XLSX form and try again."
-            ),
-            metadata={"intent": "fill_form", "status": "error", "error": str(exc)},
+        msg = f"Error processing {form_filename}: {exc}"
+        print(f"  [fill_form] ERROR: {msg}")
+        _audit("task_failed", msg, node_name="fill_form",
+               status="failure", error_message=str(exc),
+               input_payload={"task_id": task_id, "filename": form_filename})
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg[:500], duration_ms=0)
+        mark_pursuit_status(client, pursuit_id, "backlog",
+                            notes=f"Auto-revert: {msg[:200]}")
+        notify_task_failed(
+            agent_name="tender-agent",
+            task_title=f"Form fill failed: {form_filename}",
+            error_message=str(exc)[:300],
         )
         client.track("error_rate", 1.0, metadata={
             "node": "fill_form", "error_type": type(exc).__name__,
         })
 
-    # Flush metrics
     try:
-        flushed = client.flush()
-        print(f"Metrics flushed: {flushed.inserted} events sent to AMS")
+        client.flush()
     except Exception as exc:
-        print(f"Metric flush failed: {exc}")
+        print(f"  [fill_form] Metric flush failed: {exc}")
 
 
-def _handle_form_answers(client: NexusClient, thread_id: str, user_text: str, session: dict) -> None:
-    """Process user's answers to clarification questions and generate the filled form."""
-    start_time = time.perf_counter()
+def _submit_filled_form(
+    client: NexusClient,
+    task_id: str,
+    pursuit_id,
+    tmp_dir: str,
+    local_path: str,
+    original_filename: str,
+    tender_title: str,
+    fill_result: FillResult,
+    duration_ms: int,
+) -> None:
+    """Write the filled form to disk, submit it for approval, advance the pursuit.
 
-    fill_result: FillResult = session["fill_result"]
-    parse_result = session["parse_result"]
-    company_context = session["company_context"]
-
-    # Parse user answers — use LLM to map free-text answers to field names
-    questions = fill_result.questions
-    field_names = [q.field_name for q in questions]
-
-    try:
-        result = call_llm(
-            f"""The user was asked to provide values for these form fields:
-{json.dumps(field_names, indent=2)}
-
-The user replied:
-"{user_text}"
-
-Extract the answer for each field. Respond with ONLY valid JSON:
-{{
-  "answers": {{
-    "field name": "value from user's reply",
-    ...
-  }}
-}}
-
-Rules:
-- Map each part of the user's reply to the most likely field
-- If the user's reply is numbered (1, 2, 3...) map by order
-- If a field is not addressed, set it to empty string
-- Be smart about parsing — the user may give all answers in one message""",
-            max_tokens=500,
-        )
-        content = result["content"].strip()
-        if "```" in content:
-            content = content.split("```")[1].strip()
-            if content.startswith("json"):
-                content = content[4:].strip()
-        parsed = json.loads(content)
-        user_answers = parsed.get("answers", {})
-    except Exception as exc:
-        print(f"Failed to parse user answers: {exc}")
-        # Fallback: if there's only one question, use the full text as the answer
-        if len(questions) == 1:
-            user_answers = {questions[0].field_name: user_text}
-        else:
-            user_answers = {}
-
-    # Re-run the filler with user answers
-    filler = FormFiller(llm_call_fn=call_llm, confidence_threshold=0.7)
-    new_fill_result = filler.fill(parse_result, company_context, user_answers)
-
-    # Merge: use all previously filled fields + newly filled ones
-    all_filled = list(fill_result.filled_fields) + list(new_fill_result.filled_fields)
-
-    # Deduplicate by field name (prefer user-provided answers)
-    seen = {}
-    for ff in reversed(all_filled):  # reversed so later entries (user answers) win
-        if ff.name not in seen:
-            seen[ff.name] = ff
-    merged_fields = list(seen.values())
-
-    # Update session
-    session["fill_result"] = FillResult(
-        filled_fields=merged_fields,
-        questions=[],
-        total_fields=fill_result.total_fields,
-        filled_count=len(merged_fields),
-        needs_clarification_count=0,
-    )
-    session["waiting_for_answers"] = False
-
-    duration_ms = int((time.perf_counter() - start_time) * 1000)
-    _generate_and_send_form(client, thread_id, session, duration_ms)
-
-
-def _generate_and_send_form(client: NexusClient, thread_id: str, session: dict, duration_ms: int) -> None:
-    """Generate the filled form and submit it for human approval.
-
-    Instead of sending the form directly to chat, it goes to the Approvals
-    inbox where the user can review, approve, or reject it.
+    No chat reply — the operator picks up the result in /approvals.
     """
-    fill_result: FillResult = session["fill_result"]
-    local_path = session["local_path"]
-    filename = session["filename"]
-    tmp_dir = session["tmp_dir"]
-
-    # Generate the filled form
-    print("Writing filled form...")
     writer = FormWriter()
-    stem = Path(filename).stem
-    ext = Path(filename).suffix
+    stem = Path(original_filename).stem
+    ext = Path(original_filename).suffix
     output_filename = f"{stem}_FILLED{ext}"
     output_path = os.path.join(tmp_dir, output_filename)
-
     writer.write(local_path, fill_result.filled_fields, output_path)
 
-    # Build output summary for the approval card
-    filled_field_summary = {
-        ff.name: ff.value
-        for ff in fill_result.filled_fields[:30]
-    }
+    filled_field_summary = {ff.name: ff.value for ff in fill_result.filled_fields[:30]}
+    low_confidence_names = [
+        ff.name for ff in fill_result.filled_fields if ff.confidence < 0.7
+    ]
     output_summary = {
         "filled_count": fill_result.filled_count,
         "total_fields": fill_result.total_fields,
         "filled_fields": filled_field_summary,
+        "low_confidence_field_names": low_confidence_names,
+        "pursuit_id": pursuit_id,
     }
 
-    # Submit for approval instead of sending directly
     try:
-        print(f"Submitting form for approval: {output_filename}")
+        print(f"  [fill_form] Submitting for approval: {output_filename}")
         result = client.submit_for_approval(
-            thread_id=thread_id,
+            thread_id=None,
             action_type="form_fill",
-            title=f"Filled Form: {filename}",
+            title=f"Filled Form: {tender_title}",
             description=(
-                f"I filled {fill_result.filled_count} out of {fill_result.total_fields} fields "
-                f"using your company documents. Please review the completed form before it's finalized."
+                f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields on "
+                f"{original_filename} for tender '{tender_title}'. "
+                f"{len(low_confidence_names)} field(s) flagged low-confidence — "
+                f"please review before approving."
             ),
             input_summary={
-                "original_filename": filename,
+                "original_filename": original_filename,
                 "total_fields": fill_result.total_fields,
+                "pursuit_id": pursuit_id,
+                "task_id": task_id,
             },
             output_summary=output_summary,
             file_path=output_path,
@@ -1981,51 +1727,18 @@ def _generate_and_send_form(client: NexusClient, thread_id: str, session: dict, 
                 "duration_ms": duration_ms,
                 "cost_usd": fill_result.llm_cost_usd,
                 "llm_model": LLM_MODEL,
+                "pursuit_id": pursuit_id,
             },
         )
         submission_id = result.get("submissionId", "?")
-        print(f"Submitted for approval! ID: {submission_id}")
+        print(f"  [fill_form] Approval submission created: {submission_id}")
 
-        # Build summary for the chat message
-        summary_lines = []
-        for ff in fill_result.filled_fields[:10]:
-            confidence_icon = "\u2705" if ff.confidence >= 0.7 else "\u26a0\ufe0f"
-            summary_lines.append(f"  {confidence_icon} **{ff.name}**: {ff.value}")
-        summary = "\n".join(summary_lines)
-        if len(fill_result.filled_fields) > 10:
-            summary += f"\n  _...and {len(fill_result.filled_fields) - 10} more fields_"
-
-        # Tell the user to check the Approvals page
-        client.reply(
-            thread_id=thread_id,
-            content=(
-                f"## \U0001f4cb Form Ready for Review: {filename}\n\n"
-                f"I've filled **{fill_result.filled_count}/{fill_result.total_fields}** fields "
-                f"using your company documents.\n\n"
-                f"### Preview of filled fields:\n{summary}\n\n"
-                f"---\n\n"
-                f"\U0001f449 **The completed form is now in your [Approvals](/approvals) inbox.** "
-                f"Please review it there and click **Approve** to send the final file, "
-                f"or **Reject** with feedback if changes are needed.\n\n"
-                f"_Processing took {duration_ms}ms._"
-            ),
-            metadata={
-                "intent": "fill_form",
-                "status": "awaiting_approval",
-                "submission_id": submission_id,
-                "fields_filled": fill_result.filled_count,
-                "fields_total": fill_result.total_fields,
-                "duration_ms": duration_ms,
-            },
-        )
-
-        # Slack notification — form filling completed
         notify_task_completed(
             agent_name="tender-agent",
-            task_title=f"Form Filled: {filename}",
+            task_title=f"Form Filled: {tender_title}",
             summary=(
                 f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields "
-                f"using company documents. Submitted for human review."
+                f"on '{original_filename}'. Submitted for human review."
             ),
             metrics={
                 "duration_ms": duration_ms,
@@ -2036,397 +1749,354 @@ def _generate_and_send_form(client: NexusClient, thread_id: str, session: dict, 
             task_type="form_fill",
         )
 
-        # Audit: submission created
-        _audit(
-            "task_completed",
-            f"Form submitted for approval: {filename} ({fill_result.filled_count}/{fill_result.total_fields} fields)",
-            node_name="fill_form",
-            duration_ms=duration_ms,
-            cost_usd=fill_result.llm_cost_usd,
-            output_payload={"submission_id": submission_id, **output_summary},
-        )
+        _audit("task_completed",
+               f"Form submitted for approval: {output_filename} "
+               f"({fill_result.filled_count}/{fill_result.total_fields})",
+               node_name="fill_form",
+               duration_ms=duration_ms,
+               cost_usd=fill_result.llm_cost_usd,
+               output_payload={"submission_id": submission_id, **output_summary})
+
+        complete_agent_task(client, task_id, status="completed",
+                            result_summary=(
+                                f"Filled {fill_result.filled_count}/"
+                                f"{fill_result.total_fields} fields; "
+                                f"submission {submission_id}"
+                            ),
+                            duration_ms=duration_ms,
+                            tokens_used=0,
+                            cost_usd=fill_result.llm_cost_usd,
+                            llm_calls=getattr(fill_result, "llm_calls", 0),
+                            documents_used=1,
+                            metadata={"submission_id": submission_id,
+                                      "pursuit_id": pursuit_id})
+        mark_pursuit_status(client, pursuit_id, "form_filling",
+                            notes=f"Form submitted for approval (id={submission_id})")
 
     except Exception as exc:
-        print(f"Failed to submit for approval: {exc}")
+        print(f"  [fill_form] Failed to submit for approval: {exc}")
         traceback.print_exc()
-
-        # Fallback: send the form directly in chat (skip approval)
-        try:
-            client.reply_with_file(
-                thread_id=thread_id,
-                content=(
-                    f"## \u2705 Form Completed: {filename}\n\n"
-                    f"I've filled **{fill_result.filled_count}/{fill_result.total_fields}** fields.\n\n"
-                    f"\u26a0\ufe0f _Note: The approval system was unavailable, so I'm sending the form directly. "
-                    f"Please review it carefully before using._"
-                ),
-                file_path=output_path,
-                filename=output_filename,
-                metadata={"intent": "fill_form", "status": "direct_send_fallback"},
-            )
-        except Exception as fallback_exc:
-            client.reply(
-                thread_id=thread_id,
-                content=f"Sorry, I filled the form but couldn't send it: {str(fallback_exc)}",
-                metadata={"intent": "fill_form", "status": "error"},
-            )
-
-    # Clean up session
-    if thread_id in _form_sessions:
-        del _form_sessions[thread_id]
-
-
-def _format_questions(fill_result: FillResult) -> str:
-    """Format clarification questions for the user."""
-    lines = []
-    for i, q in enumerate(fill_result.questions, 1):
-        lines.append(f"**{i}. {q.field_name}**")
-        lines.append(f"   {q.question}")
-        if q.suggestions:
-            lines.append(f"   _Suggestion: {q.suggestions[0]}_")
-        lines.append("")
-    return "\n".join(lines)
-
-
-def generate_natural_response(user_message: str, intent: dict, results_text: str, num_results: int) -> str:
-    """Use LLM to generate a natural, conversational response."""
-    try:
-        if intent["intent"] == "greeting":
-            result = call_llm(
-                f"""The user said: "{user_message}"
-You are the Tender Agent — a friendly AI that helps find government and enterprise tenders related to Safety Data Sheets (SDS), chemical safety, and EHS compliance.
-You can: search for tenders globally, read company documents uploaded in the AMS Documents section, and fill out tender forms.
-Respond naturally in 2-3 sentences. Introduce yourself briefly and mention your capabilities.""",
-                max_tokens=200,
-            )
-            return result["content"]
-
-        if intent["intent"] == "ask_question":
-            result = call_llm(
-                f"""The user asked: "{user_message}"
-You are the Tender Agent specializing in SDS/EHS/chemical safety tenders.
-You have access to company documents uploaded in the AMS Documents section — use them to answer questions about the company.
-{fetch_agent_context()}
-Answer their question concisely using the document context above if relevant. If you don't have the information, say so and offer to search for relevant tenders instead.""",
-                max_tokens=500,
-            )
-            return result["content"]
-
-        # For search results, generate a summary
-        if num_results > 0:
-            result = call_llm(
-                f"""The user asked: "{user_message}"
-I searched globally and found {num_results} tender opportunities. Here are the results:
-
-{results_text}
-
-Write a natural 2-3 sentence executive summary. Mention the most promising opportunity, which region/agency it's from, and why it's relevant to SDS/EHS. Be specific, not generic.""",
-                max_tokens=300,
-            )
-            return result["content"]
-        else:
-            return f"I searched globally for tenders matching your request but didn't find strong matches right now. Try rephrasing — for example: 'find chemical safety compliance RFPs in Europe' or 'SDS management tenders in the US'."
-
-    except Exception as exc:
-        print(f"Natural response generation failed: {exc}")
-        return ""
-
-
-def handle_message(client: NexusClient, message: dict) -> None:
-    """Handle an incoming chat message from the AMS.
-
-    Uses LLM to understand the user's intent and respond naturally.
-    Supports: tender search, form filling, Q&A, greetings.
-    """
-    thread_id = message.get("threadId", "")
-    content = message.get("content", "")
-    sender = message.get("senderId", "unknown")
-    attachments = message.get("attachments", [])
-
-    # Strip @tender-agent mention from content
-    clean_content = content.replace("@tender-agent", "").strip()
-
-    # Set module-level context for audit helper
-    global _current_thread_id
-    _current_thread_id = thread_id
-
-    print(f"\n{'='*60}")
-    print(f"  INCOMING MESSAGE")
-    print(f"  Thread:  {thread_id}")
-    print(f"  From:    {sender}")
-    print(f"  Content: {clean_content[:100]}{'...' if len(clean_content) > 100 else ''}")
-    if attachments:
-        print(f"  Attachments: {len(attachments)} file(s)")
-        for att in attachments:
-            print(f"    - {att.get('filename', '?')} ({att.get('mimeType', '?')})")
-    print(f"{'='*60}\n")
-
-    # Audit: task started
-    _audit(
-        "task_started",
-        f"Received message: {clean_content[:100]}",
-        input_payload={
-            "message": clean_content[:500],
-            "sender": sender,
-            "has_attachments": bool(attachments),
-            "attachment_count": len(attachments),
-            "attachment_names": [a.get("filename", "?") for a in attachments],
-        },
-    )
-
-    # Check if this is a follow-up to an active form-filling session
-    if thread_id in _form_sessions and _form_sessions[thread_id].get("waiting_for_answers"):
-        print("Continuing form-filling session (user answers)...")
-        _audit("task_started", "Continuing form-filling session (user provided answers)")
-        handle_form_filling(client, message)
-        return
-
-    client.track(
-        "conversation_volume",
-        1.0,
-        metadata={"thread_id": thread_id, "direction": "inbound"},
-    )
-
-    start_time = time.perf_counter()
-
-    try:
-        # Step 1: Understand what the user wants
-        has_attachments = len(attachments) > 0
-        print("Classifying user intent...")
-        intent = classify_intent(clean_content, has_attachments=has_attachments)
-        print(f"  Intent: {intent.get('intent', 'unknown')}")
-        print(f"  Search query: {intent.get('search_query', 'none')}")
-
-        # Audit: intent classification result
-        _audit(
-            "intent_classified",
-            f"Intent: {intent.get('intent', 'unknown')} | Query: {intent.get('search_query', 'none')[:80]}",
-            node_name="classify",
-            output_payload=intent,
-        )
-
-        # Step 2: Handle form filling
-        if intent["intent"] == "fill_form":
-            print("Routing to form-filling handler...")
-            handle_form_filling(client, message)
-            return
-
-        # Step 3: Handle greetings and questions
-        if intent["intent"] in ("greeting", "ask_question") and intent["intent"] != "search_tenders":
-            reply_text = generate_natural_response(clean_content, intent, "", 0)
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-
-            _audit(
-                "task_completed",
-                f"Sent {intent['intent']} response ({duration_ms}ms)",
-                node_name=intent["intent"],
-                duration_ms=duration_ms,
-                output_payload={"reply_length": len(reply_text)},
-            )
-
-            client.reply(
-                thread_id=thread_id,
-                content=reply_text,
-                metadata={"intent": intent["intent"], "duration_ms": duration_ms},
-            )
-            print(f"Conversational reply sent ({duration_ms}ms)")
-
-            # Slack notification for Q&A (skip greetings — too noisy)
-            if intent["intent"] == "ask_question":
-                notify_task_completed(
-                    agent_name="tender-agent",
-                    task_title=f"Q&A: {clean_content[:80]}",
-                    summary=reply_text[:200] + ("..." if len(reply_text) > 200 else ""),
-                    metrics={"duration_ms": duration_ms},
-                    task_type="question",
-                    thread_id=thread_id,
-                )
-
-            return
-
-        # Step 4: Run tender search — always pass the user's original message
-        # so region detection works correctly (LLM extraction can lose region context)
-        print("Running global tender search...")
-        reply_text, metadata = run_tender_search(clean_content)
-
-        # Step 4: Generate natural summary and prepend it
-        natural_intro = generate_natural_response(
-            clean_content, intent,
-            reply_text, metadata.get("tenders_found", 0)
-        )
-
-        if natural_intro:
-            # Replace the generic header with the natural response
-            final_reply = (
-                f"{natural_intro}\n\n"
-                f"---\n\n"
-                f"{reply_text.split('---', 1)[-1] if '---' in reply_text else reply_text}"
-            )
-        else:
-            final_reply = reply_text
-
-        metadata["thread_id"] = thread_id
-        metadata["intent"] = intent["intent"]
-        client.reply(
-            thread_id=thread_id,
-            content=final_reply,
-            metadata=metadata,
-        )
-
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        print(f"Reply sent! Found {metadata['tenders_found']} tenders ({duration_ms}ms)")
-
-        # Slack notification — tender search completed
-        notify_task_completed(
-            agent_name="tender-agent",
-            task_title=f"Tender Search: {clean_content[:80]}",
-            summary=f"Found {metadata['tenders_found']} verified tenders matching the query.",
-            metrics={
-                "duration_ms": duration_ms,
-                "cost_usd": metadata.get("cost_usd", 0),
-                "tokens_used": metadata.get("tokens_input", 0) + metadata.get("tokens_output", 0),
-                "tenders_found": metadata.get("tenders_found", 0),
-            },
-            task_type="tender_search",
-            thread_id=thread_id,
-        )
-
-        # Audit: search completed
-        _audit(
-            "task_completed",
-            f"Tender search completed: {metadata['tenders_found']} results ({duration_ms}ms)",
-            node_name="discover",
-            duration_ms=duration_ms,
-            cost_usd=metadata.get("cost_usd", 0),
-            model_used=metadata.get("model"),
-            tokens_input=metadata.get("tokens_input", 0),
-            tokens_output=metadata.get("tokens_output", 0),
-            output_payload={
-                "tenders_found": metadata["tenders_found"],
-                "top_relevance": metadata.get("top_relevance", 0),
-                "search_source": metadata.get("search_source", "unknown"),
-                "intent": intent.get("intent"),
-            },
-        )
-
-        # Track ALL metric types for dashboard
-        tokens_in = metadata.get("tokens_input", 0)
-        tokens_out = metadata.get("tokens_output", 0)
-        total_tokens = tokens_in + tokens_out
-        cost = metadata.get("cost_usd", 0)
-
-        client.track("task_completion", 1.0, metadata={
-            "node": "discover",
-            "tenders_found": metadata["tenders_found"],
-        })
-        client.track("latency", float(duration_ms), metadata={
-            "node": "discover",
-        })
-        client.track("throughput", 1.0, metadata={
-            "node": "discover",
-        })
-        client.track("conversation_volume", 1.0, metadata={
-            "thread_id": thread_id,
-            "direction": "outbound",
-        })
-        if total_tokens > 0:
-            client.track("token_usage", float(total_tokens), metadata={
-                "model": LLM_MODEL,
-                "tokens_input": tokens_in,
-                "tokens_output": tokens_out,
-            })
-        if cost > 0:
-            client.track("cost", cost, metadata={
-                "node": "discover",
-                "model": LLM_MODEL,
-                "cost_usd": cost,
-                "tokens_total": total_tokens,
-            })
-        client.track("tool_calls", 1.0, metadata={
-            "tool": "serp_search",
-            "node": "discover",
-        })
-        client.track("model_distribution", 1.0, metadata={
-            "model": LLM_MODEL,
-        })
-        client.track("uptime", 1.0, metadata={})
-        client.track("user_satisfaction", 1.0, metadata={
-            "thread_id": thread_id,
-        })
-
-    except Exception as exc:
-        error_msg = f"Error: {str(exc)}"
-        print(f"ERROR: {error_msg}")
-        traceback.print_exc()
-
-        # Slack notification — task failed
-        notify_task_failed(
-            agent_name="tender-agent",
-            task_title=f"Message: {clean_content[:80]}",
-            error_message=str(exc)[:300],
-        )
-
-        # Audit: task failed
-        _audit(
-            "task_failed",
-            f"Error processing message: {str(exc)[:200]}",
-            status="failure",
-            error_message=str(exc),
-            input_payload={"message": clean_content[:300]},
-        )
-
-        client.reply(
-            thread_id=thread_id,
-            content=f"Sorry, I ran into an issue while processing your request:\n\n`{str(exc)}`\n\nCould you try rephrasing? For example: 'find SDS management tenders in Europe'",
-            metadata={"error": str(exc), "node": "discover"},
-        )
-
-        client.track("error_rate", 1.0, metadata={
-            "node": "discover",
-            "error_type": type(exc).__name__,
-        })
-        client.track("task_completion", 0.0, metadata={
-            "node": "discover",
-            "status": "failure",
-        })
-
-    # Always flush metrics after handling a message
-    try:
-        flushed = client.flush()
-        print(f"Metrics flushed: {flushed.inserted} events sent to AMS")
-    except Exception as exc:
-        print(f"Metric flush failed: {exc}")
+        _audit("task_failed", f"Submission creation failed: {exc}",
+               node_name="fill_form", status="failure", error_message=str(exc),
+               input_payload={"task_id": task_id, "pursuit_id": pursuit_id})
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=f"Submission API failed: {exc}",
+                            duration_ms=duration_ms)
 
 
 # ---------------------------------------------------------------------------
-# Main — Registration + Heartbeat + Inbox Polling
+# HTTP helpers — search-jobs queue, agent-tasks queue, pursuit updates
+# ---------------------------------------------------------------------------
+# NOTE: There is no bearer auth on these endpoints in this codebase. The
+# AMS-side routes look up the agent by URL slug and trust internal traffic.
+# If the team later adds an agent API key, set it in the .env as
+# NEXUS_AGENT_API_KEY and the AUTH_HEADERS dict below will be sent.
+
+import httpx as _httpx  # noqa: E402  (lazy import to avoid top-of-file churn)
+
+_AGENT_NAME = "tender-agent"
+_AUTH_HEADERS: dict[str, str] = {}
+_agent_api_key = os.getenv("NEXUS_AGENT_API_KEY", "").strip()
+if _agent_api_key:
+    _AUTH_HEADERS["Authorization"] = f"Bearer {_agent_api_key}"
+
+
+def _ams_url(path: str) -> str:
+    return f"{NEXUS_URL.rstrip('/')}{path}"
+
+
+def poll_search_jobs() -> list[dict]:
+    """GET /api/agents/tender-agent/search-jobs?status=queued
+
+    Returns a list of job rows. Returns [] silently on any network error so
+    the main loop doesn't crash when AMS is briefly down.
+    """
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/search-jobs?status=queued")
+        resp = _httpx.get(url, headers=_AUTH_HEADERS, timeout=10.0)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        if isinstance(data, dict):
+            return data.get("jobs") or data.get("searchJobs") or []
+        if isinstance(data, list):
+            return data
+        return []
+    except _httpx.ConnectError:
+        return []
+    except Exception as exc:
+        print(f"  [poll_search_jobs] {exc}")
+        return []
+
+
+def claim_search_job(job_id: str) -> bool:
+    """PATCH the job to status=running. Returns True on success."""
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/search-jobs/{job_id}")
+        resp = _httpx.patch(
+            url,
+            json={"status": "running", "startedAt": datetime.now(timezone.utc).isoformat()},
+            headers=_AUTH_HEADERS,
+            timeout=10.0,
+        )
+        return resp.status_code in (200, 204)
+    except Exception as exc:
+        print(f"  [claim_search_job {job_id}] {exc}")
+        return False
+
+
+def push_discovered_tenders(job_id: str, tenders: list[dict]) -> dict:
+    """POST /api/agents/tender-agent/discovered-tenders — batch upsert.
+
+    AMS upserts by fingerprint, so re-pushing the same tender across
+    multiple searches is safe (idempotent).
+    """
+    if not tenders:
+        return {"inserted": 0, "updated": 0}
+    url = _ams_url(f"/api/agents/{_AGENT_NAME}/discovered-tenders")
+    try:
+        resp = _httpx.post(
+            url,
+            json={"searchId": job_id, "tenders": tenders},
+            headers=_AUTH_HEADERS,
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.content else {"inserted": len(tenders)}
+    except Exception as exc:
+        print(f"  [push_discovered_tenders {job_id}] {exc}")
+        raise
+
+
+def complete_search_job(job_id: str, stats: dict) -> None:
+    """PATCH the job to status=completed with the run stats."""
+    payload = {
+        "status": "completed",
+        "completedAt": datetime.now(timezone.utc).isoformat(),
+        "totalFound": int(stats.get("totalFound", 0)),
+        "blockedExpired": int(stats.get("blockedExpired", 0)),
+        "blockedRelevance": int(stats.get("blockedRelevance", 0)),
+        "deduplicated": int(stats.get("deduplicated", 0)),
+        "metadata": {
+            "serpFallbackUsed": stats.get("serpFallbackUsed", False),
+            "durationMs": stats.get("durationMs", 0),
+        },
+    }
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/search-jobs/{job_id}")
+        _httpx.patch(url, json=payload, headers=_AUTH_HEADERS, timeout=10.0)
+    except Exception as exc:
+        print(f"  [complete_search_job {job_id}] {exc}")
+
+
+def fail_search_job(job_id: str, error: str) -> None:
+    """PATCH the job to status=failed with an error message."""
+    payload = {
+        "status": "failed",
+        "completedAt": datetime.now(timezone.utc).isoformat(),
+        "errorMessage": str(error)[:1000],
+    }
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/search-jobs/{job_id}")
+        _httpx.patch(url, json=payload, headers=_AUTH_HEADERS, timeout=10.0)
+    except Exception as exc:
+        print(f"  [fail_search_job {job_id}] {exc}")
+
+
+def poll_agent_tasks() -> list[dict]:
+    """GET /api/agents/tender-agent/tasks — queued/in_progress agent tasks."""
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/tasks")
+        resp = _httpx.get(url, headers=_AUTH_HEADERS, timeout=10.0)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        if isinstance(data, dict):
+            return data.get("tasks") or []
+        if isinstance(data, list):
+            return data
+        return []
+    except _httpx.ConnectError:
+        return []
+    except Exception as exc:
+        print(f"  [poll_agent_tasks] {exc}")
+        return []
+
+
+def mark_agent_task_running(client: NexusClient, task_id: str) -> None:
+    """POST /api/agents/tender-agent/tasks — bump status to in_progress."""
+    if not task_id:
+        return
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/tasks")
+        _httpx.post(
+            url,
+            json={"taskId": task_id, "status": "in_progress"},
+            headers=_AUTH_HEADERS,
+            timeout=10.0,
+        )
+    except Exception as exc:
+        print(f"  [mark_agent_task_running {task_id}] {exc}")
+
+
+def complete_agent_task(
+    client: NexusClient,
+    task_id: str,
+    status: str,
+    result_summary: str,
+    duration_ms: int,
+    tokens_used: int = 0,
+    cost_usd: float = 0.0,
+    llm_calls: int = 0,
+    documents_used: int = 0,
+    metadata: dict | None = None,
+) -> None:
+    """POST /api/agents/tender-agent/tasks — final task status + metrics."""
+    if not task_id:
+        return
+    payload = {
+        "taskId": task_id,
+        "status": status,
+        "resultSummary": result_summary,
+        "durationMs": duration_ms,
+        "tokensUsed": tokens_used,
+        "costUsd": cost_usd,
+        "llmCalls": llm_calls,
+        "documentsUsed": documents_used,
+        "metadata": metadata or {},
+    }
+    try:
+        url = _ams_url(f"/api/agents/{_AGENT_NAME}/tasks")
+        _httpx.post(url, json=payload, headers=_AUTH_HEADERS, timeout=10.0)
+    except Exception as exc:
+        print(f"  [complete_agent_task {task_id}] {exc}")
+
+
+def mark_pursuit_status(
+    client: NexusClient,
+    pursuit_id,
+    new_status: str,
+    notes: str | None = None,
+) -> None:
+    """PATCH /api/tender-pursuits/{id} — advance the linked pursuit lane.
+
+    Quietly skipped if the pursuit_id is missing (manual tasks have none).
+    """
+    if not pursuit_id:
+        return
+    url = _ams_url(f"/api/tender-pursuits/{pursuit_id}")
+    payload: dict = {"status": new_status}
+    if notes:
+        payload["notes"] = notes
+    try:
+        _httpx.patch(url, json=payload, headers=_AUTH_HEADERS, timeout=10.0)
+    except Exception as exc:
+        print(f"  [mark_pursuit_status {pursuit_id}] {exc}")
+
+
+def handle_search_job(client: NexusClient, job: dict) -> None:
+    """End-to-end handler: claim → run → push results → complete (or fail)."""
+    job_id = job.get("id")
+    filters = job.get("filters") or {}
+    if not job_id:
+        print("  [handle_search_job] dropped job with no id")
+        return
+
+    print(f"\n  >>> Claiming search job {job_id}")
+    if not claim_search_job(job_id):
+        print(f"  [handle_search_job {job_id}] could not claim (race or 404), skipping")
+        return
+
+    try:
+        _audit("task_started",
+               f"Search job {job_id} claimed",
+               input_payload={"job_id": job_id, "filters": filters})
+        result = run_tender_search(filters)
+        tenders = result.get("tenders", [])
+        stats = result.get("stats", {})
+
+        try:
+            push_discovered_tenders(job_id, tenders)
+        except Exception as push_exc:
+            # If push fails we don't want to mark the job complete with no
+            # tenders — surface the failure clearly.
+            fail_search_job(job_id, f"push_discovered_tenders failed: {push_exc}")
+            _audit("task_failed", f"Push failed for job {job_id}: {push_exc}",
+                   status="failure", error_message=str(push_exc),
+                   input_payload={"job_id": job_id})
+            return
+
+        complete_search_job(job_id, stats)
+        _audit("task_completed",
+               f"Search job {job_id} done: {stats.get('totalFound', 0)} tenders, "
+               f"{stats.get('blockedExpired', 0)} expired blocked, "
+               f"{stats.get('blockedRelevance', 0)} below relevance floor",
+               node_name="discover",
+               duration_ms=int(stats.get("durationMs", 0)),
+               output_payload={"job_id": job_id, **stats})
+
+        # Slack: notify the channel only when high-relevance hits land,
+        # to keep the channel from getting noisy on speculative searches.
+        any_high_relevance = any(
+            (t.get("relevanceScore") or 0) > 0.70 for t in tenders
+        )
+        if any_high_relevance:
+            notify_task_completed(
+                agent_name="tender-agent",
+                task_title=f"Tender search: {(filters.get('keywords') or '')[:60]}",
+                summary=(
+                    f"Found {len(tenders)} verified tenders; "
+                    f"{sum(1 for t in tenders if (t.get('relevanceScore') or 0) > 0.70)} above 70% relevance."
+                ),
+                metrics={
+                    "duration_ms": int(stats.get("durationMs", 0)),
+                    "tenders_found": len(tenders),
+                },
+                task_type="tender_search",
+            )
+    except Exception as exc:
+        traceback.print_exc()
+        fail_search_job(job_id, str(exc))
+        _audit("task_failed", f"Search job {job_id} failed: {exc}",
+               status="failure", error_message=str(exc),
+               input_payload={"job_id": job_id})
+    finally:
+        try:
+            client.flush()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main — Registration + Heartbeat + Job/Task Polling
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     print("")
     print("=" * 60)
-    print("  TENDER AGENT — Nexus AMS Bridge")
+    print("  TENDER AGENT — Nexus AMS Bridge (filter-driven)")
     print("=" * 60)
     print(f"  AMS URL:     {NEXUS_URL}")
     print(f"  LLM Model:   {LLM_MODEL}")
     print(f"  Dry Run:     {DRY_RUN}")
     print(f"  OpenRouter:  {'configured' if OPENROUTER_API_KEY else 'NOT configured'}")
+    print(f"  Agent token: {'set' if _agent_api_key else 'unset (open access)'}")
     print("=" * 60)
     print("")
 
-    # Step 1: Create client and register
     global _client
     client = NexusClient(base_url=NEXUS_URL)
-    _client = client  # Set module-level reference for audit helper
+    _client = client
 
     config = AgentConfig(
-        name="tender-agent",
+        name=_AGENT_NAME,
         display_name="Tender Agent",
         description=(
-            "Discovers and evaluates government tenders related to SDS management. "
-            "Searches SAM.gov and scores opportunities by relevance to EHS/chemical safety."
+            "Discovers and evaluates government tenders related to SDS / EHS. "
+            "Driven by filter forms in /tenders/discover; fills attached forms "
+            "on demand from /tenders/pursuits when set to Agent fill mode."
         ),
-        version="1.0.0",
+        version="2.0.0",
         python_version="3.11",
         langgraph_version="0.4.0",
         llm_provider="openrouter",
@@ -2445,33 +2115,37 @@ def main() -> None:
         embedding_model="voyage-3-large",
         embedding_dimensions=1024,
         state_fields_count=40,
-        node_names=["discover", "evaluate", "retrieve_draft", "gap_check",
-                     "slack_escalate", "assemble", "submit"],
-        tools=["sam_gov_scraper", "email_monitor", "voyage_embedder",
-               "template_engine", "slack_client", "playwright_submitter"],
+        node_names=["discover", "fill_form", "submit"],
+        tools=[
+            "sam_gov_scraper", "ted_europa", "uk_tenders", "boamp_france",
+            "world_bank", "prozorro", "canada_buys", "austender", "sa_etender",
+            "colombia_secop", "brazil_compras", "germany_bkms", "italy_anac",
+            "dominican_dgcp", "peru_oece", "world_bank_v2", "nigeria_nocopo",
+            "kenya_ppra", "uganda_gpp", "mexico_cdmx",
+            "brightdata_serp", "deadline_verifier",
+            "form_parser", "form_filler", "form_writer",
+            "voyage_embedder", "slack_client",
+        ],
         health_endpoint="http://localhost:8100/health",
-        slack_channels=["#tender-alerts"],
+        slack_channels=["#agent-updates"],
         env_vars_count=23,
         dry_run=DRY_RUN,
         budget_monthly_usd=50.0,
-        tags=["production", "government-tenders", "sds", "ehs"],
-        changelog="Bridge connection to Nexus AMS",
+        tags=["production", "government-tenders", "sds", "ehs", "filter-driven"],
+        changelog="v2: filter-driven discovery, removed chat-driven inbox loop.",
     )
 
     print("Registering with Nexus AMS...")
     try:
         resp = client.register(config)
         print(f"Registered! Agent ID: {resp.agent_id}")
-        # Notify Slack that agent is online
-        notify_agent_online("tender-agent")
+        notify_agent_online(_AGENT_NAME)
     except Exception as exc:
         print(f"Registration failed: {exc}")
         print("Make sure the AMS is running at", NEXUS_URL)
         sys.exit(1)
 
-    # Step 2: Start heartbeat in background
     print("Starting heartbeat (every 30 seconds)...")
-
     stop_event = threading.Event()
 
     def heartbeat_loop() -> None:
@@ -2485,48 +2159,53 @@ def main() -> None:
     hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     hb_thread.start()
 
-    # Step 3: Poll inbox for messages
     print("")
-    print("Listening for messages from AMS chat...")
-    print("Go to http://localhost:3000/chat and send a message mentioning @tender-agent")
-    print("Example: '@tender-agent search for SDS management tenders'")
-    print("")
+    print("Polling search-jobs and agent tasks every 5s...")
     print("Press Ctrl+C to stop.")
     print("")
 
     try:
         while True:
             try:
-                # Poll the inbox endpoint for new messages
-                import httpx
-                inbox_url = f"{NEXUS_URL}/api/agents/tender-agent/inbox"
-                resp = httpx.get(inbox_url, timeout=10.0)
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    # Handle both { "messages": [...] } and plain [...]
-                    if isinstance(data, dict):
-                        messages = data.get("messages", [])
-                    elif isinstance(data, list):
-                        messages = data
-                    else:
-                        messages = []
-                    for msg in messages:
-                        handle_message(client, msg)
-
-            except httpx.ConnectError:
-                pass  # AMS not reachable, will retry
+                jobs = poll_search_jobs()
+                for job in jobs:
+                    handle_search_job(client, job)
             except Exception as exc:
-                print(f"Inbox polling error: {exc}")
+                print(f"  [search-jobs loop] {exc}")
+                traceback.print_exc()
 
-            time.sleep(2.0)  # Poll every 2 seconds
+            try:
+                tasks = poll_agent_tasks()
+                for task in tasks:
+                    task_status = task.get("status")
+                    if task_status not in ("queued",):
+                        # Skip in_progress to avoid double-processing
+                        continue
+                    task_type = (
+                        (task.get("metadata") or {}).get("type")
+                        or task.get("type")
+                        or "fill_form"
+                    )
+                    if task_type == "fill_form":
+                        mark_agent_task_running(client, task.get("id"))
+                        handle_fill_form_task(client, task)
+                    else:
+                        print(f"  [agent-tasks] Skipping unknown task type: {task_type}")
+            except Exception as exc:
+                print(f"  [agent-tasks loop] {exc}")
+                traceback.print_exc()
+
+            time.sleep(5.0)
 
     except KeyboardInterrupt:
         print("\n\nShutting down...")
         stop_event.set()
-        notify_agent_offline("tender-agent")
-        client.flush()
-        client.close()
+        notify_agent_offline(_AGENT_NAME)
+        try:
+            client.flush()
+            client.close()
+        except Exception:
+            pass
         print("Tender Agent bridge stopped.")
 
 

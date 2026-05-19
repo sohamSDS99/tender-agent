@@ -358,8 +358,8 @@ REGION_KEYWORDS: dict[str, list[str]] = {
     "canada": ["canada", "canadian"],
     "australia": ["australia", "australian"],
     "india": ["india", "indian"],
-    "south_america": ["brazil", "brazilian", "colombia", "colombian", "peru", "peruvian", "ecuador", "chile", "argentina", "south america", "latin america", "dominican republic", "honduras", "guatemala", "caribbean"],
-    "africa": ["south africa", "african", "africa", "nigeria", "kenya", "rwanda", "ghana"],
+    "south_america": ["brazil", "brazilian", "colombia", "colombian", "peru", "peruvian", "ecuador", "chile", "argentina", "south america", "latin america", "dominican republic", "honduras", "guatemala", "caribbean", "mexico", "mexican", "mexico city", "cdmx"],
+    "africa": ["south africa", "african", "africa", "nigeria", "kenya", "rwanda", "ghana", "uganda", "ugandan", "east africa"],
 }
 
 
@@ -405,8 +405,8 @@ REGION_COUNTRY_NAMES: dict[str, list[str]] = {
     "canada": ["Canada", "Canadian"],
     "australia": ["Australia", "Australian", "NSW", "Victoria", "Queensland"],
     "india": ["India", "Indian"],
-    "south_america": ["South America", "Latin America", "Brazil", "Colombia", "Peru"],
-    "africa": ["Africa", "South Africa", "Nigeria", "Kenya"],
+    "south_america": ["South America", "Latin America", "Brazil", "Colombia", "Peru", "Mexico"],
+    "africa": ["Africa", "South Africa", "Nigeria", "Kenya", "Uganda"],
 }
 
 

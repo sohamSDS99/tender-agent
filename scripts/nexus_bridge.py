@@ -52,6 +52,11 @@ from src.discovery.germany_bkms import GermanyBkmsSearcher
 from src.discovery.italy_anac import ItalyAnacSearcher
 from src.discovery.dominican_dgcp import DominicanDgcpSearcher
 from src.discovery.peru_oece import PeruOeceSearcher
+from src.discovery.world_bank_v2 import WorldBankV2Searcher
+from src.discovery.nigeria_nocopo import NigeriaNocopoSearcher
+from src.discovery.kenya_ppra import KenyaPpraSearcher
+from src.discovery.uganda_gpp import UgandaGppSearcher
+from src.discovery.mexico_cdmx import MexicoCdmxSearcher
 
 # Import form processing modules
 from src.forms.form_parser import FormParser
@@ -1037,6 +1042,96 @@ def run_tender_search(query: str) -> tuple[str, dict]:
             print(f"  [Peru OECE API] Failed: {exc}")
             _audit("tool_call", f"Peru OECE API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
 
+    # World Bank Search API v2 — keyword-based, global (always fires alongside existing WB)
+    if detected_region in ("global", "india", "africa", "australia"):
+        try:
+            print("  [WB Search v2 API] Querying World Bank procurement notices (keyword search)...")
+            wb2_searcher = WorldBankV2Searcher()
+            wb2_leads = wb2_searcher.search(user_query=search_query, max_results=10)
+            api_leads.extend(wb2_leads)
+            print(f"  [WB Search v2 API] Got {len(wb2_leads)} relevant World Bank tenders")
+            _audit(
+                "tool_call",
+                f"World Bank v2 API returned {len(wb2_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "world_bank_v2", "count": len(wb2_leads)},
+            )
+        except Exception as exc:
+            print(f"  [WB Search v2 API] Failed: {exc}")
+            _audit("tool_call", f"World Bank v2 API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Nigeria NOCOPO — for Africa/global queries
+    if detected_region in ("africa", "global"):
+        try:
+            print("  [Nigeria NOCOPO API] Querying Nigerian federal procurement...")
+            ng_searcher = NigeriaNocopoSearcher()
+            ng_leads = ng_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(ng_leads)
+            print(f"  [Nigeria NOCOPO API] Got {len(ng_leads)} relevant Nigerian tenders")
+            _audit(
+                "tool_call",
+                f"Nigeria NOCOPO API returned {len(ng_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "nigeria_nocopo", "count": len(ng_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Nigeria NOCOPO API] Failed: {exc}")
+            _audit("tool_call", f"Nigeria NOCOPO API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Kenya PPRA — for Africa/global queries
+    if detected_region in ("africa", "global"):
+        try:
+            print("  [Kenya PPRA API] Querying Kenyan government tenders...")
+            ke_searcher = KenyaPpraSearcher()
+            ke_leads = ke_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(ke_leads)
+            print(f"  [Kenya PPRA API] Got {len(ke_leads)} relevant Kenyan tenders")
+            _audit(
+                "tool_call",
+                f"Kenya PPRA API returned {len(ke_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "kenya_ppra", "count": len(ke_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Kenya PPRA API] Failed: {exc}")
+            _audit("tool_call", f"Kenya PPRA API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Uganda GPP — for Africa/global queries
+    if detected_region in ("africa", "global"):
+        try:
+            print("  [Uganda GPP API] Querying Ugandan government procurement...")
+            ug_searcher = UgandaGppSearcher()
+            ug_leads = ug_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(ug_leads)
+            print(f"  [Uganda GPP API] Got {len(ug_leads)} relevant Ugandan tenders")
+            _audit(
+                "tool_call",
+                f"Uganda GPP API returned {len(ug_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "uganda_gpp", "count": len(ug_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Uganda GPP API] Failed: {exc}")
+            _audit("tool_call", f"Uganda GPP API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
+    # Mexico City CDMX — for South America/global queries
+    if detected_region in ("south_america", "global"):
+        try:
+            print("  [Mexico CDMX API] Querying Mexico City procurement data...")
+            mx_searcher = MexicoCdmxSearcher()
+            mx_leads = mx_searcher.search(user_query=search_query, max_results=10, days_back=60)
+            api_leads.extend(mx_leads)
+            print(f"  [Mexico CDMX API] Got {len(mx_leads)} relevant Mexico City tenders")
+            _audit(
+                "tool_call",
+                f"Mexico CDMX API returned {len(mx_leads)} leads",
+                node_name="discover", status="success",
+                output_payload={"source": "mexico_cdmx", "count": len(mx_leads)},
+            )
+        except Exception as exc:
+            print(f"  [Mexico CDMX API] Failed: {exc}")
+            _audit("tool_call", f"Mexico CDMX API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
+
     print(f"  API total: {len(api_leads)} leads from direct government APIs")
 
     # ------------------------------------------------------------------
@@ -1097,7 +1192,7 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         reverse=True,
     )
 
-    _all_api_portals = ('ted.europa.eu', 'sam.gov', 'uk_gov', 'boamp', 'world_bank', 'prozorro', 'canada_buys', 'austender', 'sa_etender', 'colombia_secop', 'brazil_compras', 'germany_bkms', 'italy_anac', 'dominican_dgcp', 'peru_oece')
+    _all_api_portals = ('ted.europa.eu', 'sam.gov', 'uk_gov', 'boamp', 'world_bank', 'prozorro', 'canada_buys', 'austender', 'sa_etender', 'colombia_secop', 'brazil_compras', 'germany_bkms', 'italy_anac', 'dominican_dgcp', 'peru_oece', 'world_bank_v2', 'nigeria_nocopo', 'kenya_ppra', 'uganda_gpp', 'mexico_cdmx')
     api_count = len([l for l in valid_leads if getattr(l, 'source_portal', '') in _all_api_portals])
     serp_count = len(valid_leads) - api_count
 
@@ -1286,6 +1381,11 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         "italy_anac": "italy_anac",
         "dominican_dgcp": "dominican_dgcp",
         "peru_oece": "peru_oece",
+        "world_bank_v2": "world_bank_v2",
+        "nigeria_nocopo": "nigeria_nocopo",
+        "kenya_ppra": "kenya_ppra",
+        "uganda_gpp": "uganda_gpp",
+        "mexico_cdmx": "mexico_cdmx",
     }
     for portal_key, source_name in portal_to_source.items():
         if any(getattr(l, 'source_portal', '') == portal_key for l in valid_leads):

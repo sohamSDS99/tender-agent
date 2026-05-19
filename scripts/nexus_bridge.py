@@ -1887,6 +1887,8 @@ def complete_search_job(job_id: str, stats: dict) -> None:
         "metadata": {
             "serpFallbackUsed": stats.get("serpFallbackUsed", False),
             "durationMs": stats.get("durationMs", 0),
+            "brief": stats.get("brief"),
+            "broadened": stats.get("broadened", False),
         },
     }
     try:
@@ -2001,8 +2003,107 @@ def mark_pursuit_status(
         print(f"  [mark_pursuit_status {pursuit_id}] {exc}")
 
 
+def _broaden_filters(filters: dict) -> dict:
+    """Relax constraints when the strict pass returned too few results.
+
+    Drops value range, extends deadline window by 60 days, opens posted
+    window to "all", and re-enables every source. Keeps the 30% absolute
+    relevance floor in place (non-negotiable per spec). Returns a fresh
+    dict so the caller can compare before/after if needed.
+    """
+    relaxed = dict(filters or {})
+    relaxed["minValueUsd"] = None
+    relaxed["maxValueUsd"] = None
+    relaxed["postedWithinDays"] = "all"
+    relaxed["sources"] = []  # all 20 sources
+    relaxed["includeSerpFallback"] = True
+    # Extend the deadline window forward by 60 days so we catch tenders that
+    # close later than the user's original window. We never push the window
+    # earlier — expired tenders stay blocked by the deadline gates.
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        cur_to = relaxed.get("deadlineTo")
+        if cur_to:
+            base = _dt.fromisoformat(str(cur_to)).date()
+            relaxed["deadlineTo"] = (base + _td(days=60)).isoformat()
+        else:
+            relaxed["deadlineTo"] = (
+                _dt.now(_tz.utc).date() + _td(days=120)
+            ).isoformat()
+    except Exception:
+        pass
+    return relaxed
+
+
+def _generate_brief(filters: dict, tenders: list[dict], stats: dict) -> str:
+    """Write a 2–3 sentence executive brief over the result set.
+
+    Uses the same OpenRouter LLM the bridge already uses. Falls back to a
+    deterministic summary string if the LLM call fails so a brief is always
+    written to TenderSearch.metadata.brief — the UI never shows a blank.
+    """
+    n = len(tenders)
+    if n == 0:
+        return (
+            "No verified tenders matched these filters. The most common cause "
+            "is too narrow a region+keyword combination. Try broadening keywords "
+            "or selecting 'Global' to fan out across all 20 sources."
+        )
+
+    top = sorted(
+        tenders,
+        key=lambda t: float(t.get("relevanceScore") or 0),
+        reverse=True,
+    )[:5]
+    bullet_lines = []
+    for i, t in enumerate(top, 1):
+        title = (t.get("title") or "Untitled")[:120]
+        agency = (t.get("agency") or "Unknown agency")[:80]
+        score = int(round(float(t.get("relevanceScore") or 0) * 100))
+        deadline = (t.get("submissionDeadline") or "")[:10]
+        bullet_lines.append(
+            f"{i}. {title} — {agency} ({score}% relevance, closes {deadline})"
+        )
+    bullet_block = "\n".join(bullet_lines)
+
+    deterministic = (
+        f"Found {n} verified tenders. Top hit: {top[0].get('title', '?')[:100]} "
+        f"({int(round(float(top[0].get('relevanceScore') or 0) * 100))}% relevance, "
+        f"{top[0].get('agency', 'unknown agency')}). "
+        f"{stats.get('blockedExpired', 0)} expired and "
+        f"{stats.get('blockedRelevance', 0)} below relevance floor were filtered out."
+    )
+
+    if not OPENROUTER_API_KEY:
+        return deterministic
+
+    try:
+        prompt = (
+            f"You are summarising tender search results for a busy procurement lead. "
+            f"Write a 2-3 sentence executive brief in plain English (no markdown, no bullet lists). "
+            f"State the top opportunity, why it stands out, and one decision the user should make next.\n\n"
+            f"Search keywords: {(filters.get('keywords') or '').strip() or '(none)'}\n"
+            f"Region filter: {filters.get('regions') or ['global']}\n"
+            f"Result count: {n}\n\n"
+            f"Top results:\n{bullet_block}"
+        )
+        out = call_llm(prompt, max_tokens=200)
+        text = (out.get("content") or "").strip()
+        if len(text) > 40:
+            return text
+    except Exception as exc:
+        print(f"  [brief] LLM brief failed, using deterministic: {exc}")
+
+    return deterministic
+
+
 def handle_search_job(client: NexusClient, job: dict) -> None:
-    """End-to-end handler: claim → run → push results → complete (or fail)."""
+    """End-to-end handler: claim → run → push results → complete (or fail).
+
+    Includes one adaptive-broaden pass when the strict filters return fewer
+    than 5 results, plus an LLM-generated executive brief that always lands
+    in TenderSearch.metadata.brief.
+    """
     job_id = job.get("id")
     filters = job.get("filters") or {}
     if not job_id:
@@ -2018,15 +2119,53 @@ def handle_search_job(client: NexusClient, job: dict) -> None:
         _audit("task_started",
                f"Search job {job_id} claimed",
                input_payload={"job_id": job_id, "filters": filters})
+
+        # --- Pass 1: strict ------------------------------------------------
         result = run_tender_search(filters)
         tenders = result.get("tenders", [])
         stats = result.get("stats", {})
+        broadened = False
+
+        # --- Pass 2: auto-broaden when weak --------------------------------
+        # Threshold: 5. Below that, retry with relaxed constraints and merge.
+        # The user sees the union, with broadened=true flagged in metadata.
+        if len(tenders) < 5:
+            print(f"  [auto-broaden] Pass 1 returned {len(tenders)} — retrying with relaxed filters")
+            broadened = True
+            relaxed = _broaden_filters(filters)
+            try:
+                result2 = run_tender_search(relaxed)
+                tenders2 = result2.get("tenders", [])
+                stats2 = result2.get("stats", {})
+
+                seen_fps = {t.get("fingerprint") for t in tenders if t.get("fingerprint")}
+                new_only = [t for t in tenders2 if t.get("fingerprint") not in seen_fps]
+                print(f"  [auto-broaden] Pass 2 added {len(new_only)} fresh tenders")
+                tenders = tenders + new_only
+                stats["totalFound"] = len(tenders)
+                stats["blockedExpired"] = (
+                    int(stats.get("blockedExpired", 0))
+                    + int(stats2.get("blockedExpired", 0))
+                )
+                stats["blockedRelevance"] = (
+                    int(stats.get("blockedRelevance", 0))
+                    + int(stats2.get("blockedRelevance", 0))
+                )
+                stats["deduplicated"] = (
+                    int(stats.get("deduplicated", 0))
+                    + int(stats2.get("deduplicated", 0))
+                )
+            except Exception as exc:
+                print(f"  [auto-broaden] Pass 2 failed: {exc}")
+
+        # --- Brief ---------------------------------------------------------
+        brief = _generate_brief(filters, tenders, stats)
+        stats["brief"] = brief
+        stats["broadened"] = broadened
 
         try:
             push_discovered_tenders(job_id, tenders)
         except Exception as push_exc:
-            # If push fails we don't want to mark the job complete with no
-            # tenders — surface the failure clearly.
             fail_search_job(job_id, f"push_discovered_tenders failed: {push_exc}")
             _audit("task_failed", f"Push failed for job {job_id}: {push_exc}",
                    status="failure", error_message=str(push_exc),

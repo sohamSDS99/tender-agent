@@ -1719,9 +1719,16 @@ def push_discovered_tenders(job_id: str, tenders: list[dict]) -> dict:
     AMS upserts by fingerprint, so re-pushing the same tender across
     multiple searches is safe (idempotent).
     """
+    print(f"  [push] About to POST {len(tenders)} tenders for job {job_id[:8]}")
     if not tenders:
+        print(f"  [push] tender list is empty — nothing to send")
         return {"inserted": 0, "updated": 0}
+    # Log the first tender's keys so we can spot a schema mismatch.
+    print(f"  [push] first tender keys: {sorted(tenders[0].keys())}")
+    print(f"  [push] first tender title: {(tenders[0].get('title') or '')[:80]}")
+    print(f"  [push] first tender deadline: {tenders[0].get('submissionDeadline')}")
     url = _ams_url(f"/api/agents/{_AGENT_NAME}/discovered-tenders")
+    print(f"  [push] POST {url}")
     try:
         resp = _httpx.post(
             url,
@@ -1729,6 +1736,7 @@ def push_discovered_tenders(job_id: str, tenders: list[dict]) -> dict:
             headers=_AUTH_HEADERS,
             timeout=60.0,
         )
+        print(f"  [push] HTTP {resp.status_code} | body[:300]: {resp.text[:300]}")
         resp.raise_for_status()
         return resp.json() if resp.content else {"inserted": len(tenders)}
     except Exception as exc:
@@ -1990,7 +1998,10 @@ def handle_search_job(client: NexusClient, job: dict) -> None:
         # --- Pass 2: auto-broaden when weak --------------------------------
         # Threshold: 5. Below that, retry with relaxed constraints and merge.
         # The user sees the union, with broadened=true flagged in metadata.
-        if len(tenders) < 5:
+        # Auto-broaden only when pass 1 is genuinely sparse. 3+ results is
+        # enough for a useful demo / triage; running pass 2 anyway just
+        # doubles the user's wait time without adding meaningful coverage.
+        if len(tenders) < 3:
             print(f"  [auto-broaden] Pass 1 returned {len(tenders)} — retrying with relaxed filters")
             broadened = True
             relaxed = _broaden_filters(filters)

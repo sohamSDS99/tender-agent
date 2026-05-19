@@ -1351,7 +1351,38 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         "italy_anac":      "\U0001f1ee\U0001f1f9 ANAC Italy",
         "dominican_dgcp":  "\U0001f1e9\U0001f1f4 DGCP Dom. Rep.",
         "peru_oece":       "\U0001f1f5\U0001f1ea OECE Peru",
+        "world_bank_v2":   "\U0001f30d World Bank v2",
+        "nigeria_nocopo":  "\U0001f1f3\U0001f1ec NOCOPO Nigeria",
+        "kenya_ppra":      "\U0001f1f0\U0001f1ea PPRA Kenya",
+        "uganda_gpp":      "\U0001f1fa\U0001f1ec GPP Uganda",
+        "mexico_cdmx":     "\U0001f1f2\U0001f1fd CDMX Mexico",
     }
+
+    # ---------------------------------------------------------------
+    # FINAL SAFETY NET: Re-verify every deadline right before display.
+    # Belt-and-suspenders — if anything slipped past earlier filters,
+    # this catches it. Zero expired tenders shown. Period.
+    # ---------------------------------------------------------------
+    from dateutil import parser as dateparser
+    _today_final = datetime.now(timezone.utc).date()
+    _display_leads: list = []
+    for _lead in valid_leads:
+        _dl = getattr(_lead, 'submission_deadline', '') or ''
+        if not _dl or len(_dl) < 8:
+            print(f"  [SAFETY NET] Blocked (no deadline): {getattr(_lead, 'title', '?')[:60]}")
+            continue
+        try:
+            _parsed = dateparser.parse(_dl).date()
+            if _parsed < _today_final:
+                print(f"  [SAFETY NET] Blocked (expired {_dl}): {getattr(_lead, 'title', '?')[:60]}")
+                continue
+        except Exception:
+            print(f"  [SAFETY NET] Blocked (unparseable '{_dl}'): {getattr(_lead, 'title', '?')[:60]}")
+            continue
+        _display_leads.append(_lead)
+    if len(_display_leads) < len(valid_leads):
+        print(f"  [SAFETY NET] Removed {len(valid_leads) - len(_display_leads)} leads at final check")
+    valid_leads = _display_leads
 
     formatted_items = []
     for i, lead in enumerate(valid_leads[:10], 1):

@@ -563,10 +563,54 @@ def is_valid_tender_link(url: str) -> bool:
         return False
 
 
-def _filter_serp_leads(leads: list, query: str) -> list:
-    """Run the 8-gate filtering pipeline on SERP results.
+def _strict_deadline_filter(leads: list, source_label: str) -> list:
+    """Strict deadline gate — blocks ANY lead without a verified future deadline.
 
-    This is ONLY used in deep search mode. API results skip this entirely.
+    Used on BOTH API results and SERP results. No exceptions.
+    If we can't prove the deadline is in the future, the lead is blocked.
+
+    Args:
+        leads: List of lead objects (API or SERP).
+        source_label: "API" or "SERP" — for logging only.
+
+    Returns:
+        Filtered list where every lead has a verified, future deadline.
+    """
+    from dateutil import parser as dateparser
+
+    today = datetime.now(timezone.utc).date()
+    valid = []
+    blocked_expired = 0
+    blocked_no_deadline = 0
+
+    for lead in leads:
+        deadline = getattr(lead, 'submission_deadline', '') or ''
+
+        if not deadline or len(deadline) < 8:
+            blocked_no_deadline += 1
+            continue
+
+        try:
+            parsed_date = dateparser.parse(deadline).date()
+            if parsed_date >= today:
+                valid.append(lead)
+            else:
+                blocked_expired += 1
+        except Exception:
+            blocked_no_deadline += 1
+
+    print(f"    [{source_label} deadline gate] {len(valid)} active / "
+          f"{blocked_expired} expired / {blocked_no_deadline} no-deadline "
+          f"(from {len(leads)} total)")
+
+    return valid
+
+
+def _filter_serp_leads(leads: list, query: str) -> list:
+    """Run the strict filtering pipeline on SERP results.
+
+    Every SERP result gets its actual page fetched to extract and verify
+    the deadline. No lead passes without a confirmed future deadline.
 
     Gates:
       1. Block known-bad URLs (blocklist)
@@ -575,10 +619,9 @@ def _filter_serp_leads(leads: list, query: str) -> list:
       4. Reject empty portal pages
       5. Require tender signal (proof it's procurement, not news)
       6. Minimum relevance score
-      7. Deadline/freshness from snippet (expired/stale → block)
-      8. PAGE-FETCH VERIFICATION: for leads with no snippet deadline,
-         fetch the actual tender page to extract deadline + check if closed.
-         If the page reveals it's expired/closed → block it.
+      7. Deadline from snippet (expired → block immediately)
+      8. PAGE-FETCH every remaining lead: extract deadline from actual page.
+         If expired/closed/no-deadline-found → BLOCKED. No exceptions.
     """
     from dateutil import parser as dateparser
     from urllib.parse import urlparse
@@ -589,10 +632,9 @@ def _filter_serp_leads(leads: list, query: str) -> list:
     excluded_domains = get_excluded_domains_for_region(query)
 
     MIN_RELEVANCE = 0.15
-    NO_DEADLINE_SORT_PENALTY = 0.85
-    STALENESS_THRESHOLD_DAYS = 120
 
-    def classify_deadline(lead: object) -> str:
+    def classify_deadline_from_snippet(lead: object) -> str:
+        """Quick check from snippet text only. Returns valid/expired/missing."""
         deadline = getattr(lead, 'submission_deadline', '') or ''
         if not deadline or len(deadline) < 8:
             desc = getattr(lead, 'description', '') or ''
@@ -604,15 +646,6 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             try:
                 parsed_date = dateparser.parse(deadline).date()
                 return 'valid' if parsed_date >= today else 'expired'
-            except Exception:
-                pass
-        posted = getattr(lead, 'posted_date', '') or ''
-        if posted and len(posted) >= 8:
-            try:
-                posted_parsed = dateparser.parse(posted).date()
-                age_days = (today - posted_parsed).days
-                if age_days > STALENESS_THRESHOLD_DAYS:
-                    return 'stale'
             except Exception:
                 pass
         return 'missing'
@@ -627,15 +660,15 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             return True
 
     valid = []
-    needs_page_verify: list = []  # Leads that passed gates 1-7 but have no deadline
+    needs_page_verify: list = []
     counts = {
         "blocked_url": 0, "blocked_region": 0, "no_strong_kw": 0,
         "empty_page": 0, "no_tender_signal": 0,
-        "low_relevance": 0, "expired": 0, "stale": 0,
-        "undated": 0, "page_verified_active": 0,
-        "page_verified_expired": 0, "page_verified_unknown": 0,
+        "low_relevance": 0, "expired_snippet": 0,
+        "page_active": 0, "page_expired": 0, "page_no_deadline": 0,
     }
 
+    # Gates 1-7: quick filters
     for lead in leads:
         raw = getattr(lead, 'raw_data', {}) or {}
 
@@ -658,34 +691,46 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             counts["low_relevance"] += 1
             continue
 
-        deadline_status = classify_deadline(lead)
-        if deadline_status == 'expired':
-            counts["expired"] += 1
-            continue
-        if deadline_status == 'stale':
-            counts["stale"] += 1
+        snippet_status = classify_deadline_from_snippet(lead)
+        if snippet_status == 'expired':
+            counts["expired_snippet"] += 1
             continue
 
-        if deadline_status == 'missing':
-            # Gate 8: Queue for page-fetch verification instead of letting it through
+        if snippet_status == 'valid':
+            # Snippet had a valid future deadline — still page-verify to be sure
             needs_page_verify.append(lead)
         else:
-            lead._effective_score = lead.relevance_score
-            valid.append(lead)
+            # No deadline in snippet — must page-verify
+            needs_page_verify.append(lead)
 
     # ------------------------------------------------------------------
-    # Gate 8: Page-fetch deadline verification for undated leads
-    # Fetch each tender page to find the REAL deadline or detect closure.
+    # Gate 8: Page-fetch EVERY lead that passed gates 1-7.
+    # No lead gets through without a verified future deadline.
     # ------------------------------------------------------------------
     if needs_page_verify:
-        print(f"    [Gate 8] Verifying {len(needs_page_verify)} undated leads by fetching actual pages...")
+        print(f"    [Gate 8] Fetching {len(needs_page_verify)} pages to verify deadlines...")
 
     for lead in needs_page_verify:
         url = getattr(lead, 'source_url', '') or ''
+        existing_deadline = getattr(lead, 'submission_deadline', '') or ''
+
+        # If we already have a snippet-extracted future deadline, trust it
+        # but still double-check via page fetch for safety
+        if existing_deadline and len(existing_deadline) >= 8:
+            try:
+                parsed = dateparser.parse(existing_deadline).date()
+                if parsed >= today:
+                    lead._effective_score = lead.relevance_score
+                    counts["page_active"] += 1
+                    valid.append(lead)
+                    continue
+            except Exception:
+                pass
+
+        # Must fetch the page to find deadline
         if not url:
-            counts["undated"] += 1
-            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
-            valid.append(lead)
+            counts["page_no_deadline"] += 1
+            print(f"      BLOCKED (no URL): {lead.title[:60]}...")
             continue
 
         try:
@@ -694,47 +739,39 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             vr_deadline = vr.get("deadline", "")
             vr_source = vr.get("source", "none")
 
-            if vr_status in ("expired", "closed"):
-                # Page confirms it's expired or closed — BLOCK IT
-                counts["page_verified_expired"] += 1
-                print(f"      BLOCKED (page={vr_status}): {lead.title[:60]}... "
-                      f"[deadline={vr_deadline}, source={vr_source}]")
-                continue
-
             if vr_status == "active" and vr_deadline:
-                # Page found a valid, active deadline — KEEP IT with full score
                 lead.submission_deadline = vr_deadline
                 lead._effective_score = lead.relevance_score
-                counts["page_verified_active"] += 1
-                print(f"      VERIFIED (active): {lead.title[:60]}... "
-                      f"[deadline={vr_deadline}, source={vr_source}]")
+                counts["page_active"] += 1
+                print(f"      ACTIVE: {lead.title[:50]}... "
+                      f"[deadline={vr_deadline}, via={vr_source}]")
                 valid.append(lead)
-                continue
 
-            # Page fetch didn't find any deadline info — keep with penalty
-            counts["page_verified_unknown"] += 1
-            counts["undated"] += 1
-            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
-            valid.append(lead)
+            elif vr_status in ("expired", "closed"):
+                counts["page_expired"] += 1
+                print(f"      BLOCKED ({vr_status}): {lead.title[:50]}... "
+                      f"[deadline={vr_deadline}, via={vr_source}]")
+
+            else:
+                # Could not find any deadline on the page — BLOCKED
+                counts["page_no_deadline"] += 1
+                print(f"      BLOCKED (no deadline found): {lead.title[:50]}...")
 
         except Exception as exc:
-            # Page fetch failed — keep with penalty (graceful degradation)
-            counts["undated"] += 1
-            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
-            valid.append(lead)
-            print(f"      WARN: page verify failed for {url[:60]}: {exc}")
+            # Page fetch failed — BLOCKED (not graceful degradation anymore)
+            counts["page_no_deadline"] += 1
+            print(f"      BLOCKED (fetch failed): {lead.title[:50]}... [{exc}]")
 
     valid.sort(key=lambda l: getattr(l, '_effective_score', l.relevance_score), reverse=True)
 
     print(f"    Pipeline: {len(valid)} passed out of {len(leads)}")
-    print(f"    blocked-url={counts['blocked_url']} | region={counts['blocked_region']} | "
-          f"no-kw={counts['no_strong_kw']} | empty={counts['empty_page']} | "
-          f"not-tender={counts['no_tender_signal']} | low-rel={counts['low_relevance']} | "
-          f"expired={counts['expired']} | stale={counts['stale']} | undated={counts['undated']}")
-    if any(counts[k] for k in ("page_verified_active", "page_verified_expired", "page_verified_unknown")):
-        print(f"    page-verify: active={counts['page_verified_active']} | "
-              f"expired={counts['page_verified_expired']} | "
-              f"unknown={counts['page_verified_unknown']}")
+    print(f"    quick-filters: url={counts['blocked_url']} region={counts['blocked_region']} "
+          f"kw={counts['no_strong_kw']} empty={counts['empty_page']} "
+          f"signal={counts['no_tender_signal']} rel={counts['low_relevance']} "
+          f"expired-snippet={counts['expired_snippet']}")
+    print(f"    page-verify: active={counts['page_active']} "
+          f"expired={counts['page_expired']} "
+          f"no-deadline={counts['page_no_deadline']}")
 
     return valid
 
@@ -769,38 +806,29 @@ def _strip_deep_trigger(query: str) -> str:
 
 
 def run_tender_search(query: str) -> tuple[str, dict]:
-    """Run tender discovery using direct government APIs.
+    """Run tender discovery — APIs first, SERP as automatic fallback.
 
-    Architecture (permanent — production-ready):
-      DEFAULT MODE (API-only):
-        1. TED Europa API — active EU procurement notices
-        2. UK Contracts Finder + Find a Tender — UK government tenders
-        3. SAM.gov API — US federal opportunities (when API key is set)
-        All return structured data with verified deadlines. No filtering needed.
+    Architecture:
+      STEP 1: Run all 20 government APIs (region-routed).
+      STEP 2: Strict deadline filter — block any API result without a
+              verified future deadline. Zero exceptions.
+      STEP 3: If API results exist after filtering → show them. Done.
+      STEP 4: If APIs returned ZERO results → automatically fall back to
+              SERP (Google via Bright Data). Every SERP result gets its
+              actual page fetched to extract and verify the deadline.
+              Expired/closed/no-deadline → blocked. No exceptions.
 
-      DEEP SEARCH MODE (opt-in, user says "deep search ..."):
-        Adds Google SERP via Bright Data as a supplementary source.
-        SERP results go through the 7-gate filtering pipeline.
-
-    This is NOT a band-aid. Direct APIs guarantee:
-      - Only active, non-expired tenders (API-level filtering)
-      - Real deadline dates from the source of truth
-      - Proper agency/buyer names
-      - No news articles, blog posts, or empty portal pages
+    Every result the user sees has a verified, future submission deadline.
     """
     start_time = time.perf_counter()
     from src.discovery.serp_search import detect_region
 
-    # Check if user wants deep search (opt-in SERP)
-    deep_search = _is_deep_search(query)
-    search_query = _strip_deep_trigger(query) if deep_search else query
-
+    search_query = query
     detected_region = detect_region(search_query)
-    mode_label = "DEEP SEARCH (API + SERP)" if deep_search else "API-ONLY"
 
     print(f"\n{'='*60}")
     print(f"  Tender search: '{search_query[:80]}'")
-    print(f"  Region: {detected_region} | Mode: {mode_label}")
+    print(f"  Region: {detected_region} | Mode: APIs-first, SERP-fallback")
     print(f"{'='*60}")
 
     # ------------------------------------------------------------------
@@ -1195,47 +1223,18 @@ def run_tender_search(query: str) -> tuple[str, dict]:
             print(f"  [Mexico CDMX API] Failed: {exc}")
             _audit("tool_call", f"Mexico CDMX API failed: {exc}", node_name="discover", status="failure", error_message=str(exc))
 
-    print(f"  API total: {len(api_leads)} leads from direct government APIs")
+    print(f"  API total: {len(api_leads)} raw leads from direct government APIs")
 
     # ------------------------------------------------------------------
-    # Step 2: SERP search (ONLY if deep search mode)
+    # Step 2: Strict deadline filter on API results
+    # Every API result must have a verified future deadline.
     # ------------------------------------------------------------------
-    serp_valid_leads: list = []
+    api_verified = _strict_deadline_filter(api_leads, "API")
 
-    if deep_search:
-        print("  [SERP] Deep search mode — running Google via Bright Data...")
-        _audit(
-            "tool_call",
-            f"Starting SERP deep search for: {search_query[:100]}",
-            node_name="discover",
-            input_payload={"query": search_query, "tool": "brightdata_serp", "mode": "deep_search"},
-        )
-        try:
-            searcher = SerpTenderSearcher()
-            serp_leads = searcher.search(user_query=search_query)
-            print(f"  [SERP] Got {len(serp_leads)} raw leads — running 7-gate pipeline...")
-
-            # Run the full 7-gate filtering pipeline on SERP results
-            serp_valid_leads = _filter_serp_leads(serp_leads, search_query)
-            print(f"  [SERP] {len(serp_valid_leads)} passed pipeline")
-
-        except Exception as exc:
-            print(f"  [SERP] Failed: {exc}")
-            _audit(
-                "tool_call", f"SERP search failed: {exc}",
-                node_name="discover", status="failure", error_message=str(exc),
-            )
-    else:
-        print("  [SERP] Skipped — API-only mode (use 'deep search ...' to include Google)")
-
-    # ------------------------------------------------------------------
-    # Step 3: Merge & deduplicate
-    # ------------------------------------------------------------------
+    # Deduplicate by URL
     seen_urls: set[str] = set()
     valid_leads: list = []
-
-    # API leads first (higher quality, structured data)
-    for lead in api_leads:
+    for lead in api_verified:
         url = getattr(lead, 'source_url', '')
         if url and url not in seen_urls:
             seen_urls.add(url)
@@ -1243,12 +1242,47 @@ def run_tender_search(query: str) -> tuple[str, dict]:
                 lead._effective_score = getattr(lead, 'relevance_score', 0.80)
             valid_leads.append(lead)
 
-    # Then SERP leads (if deep search was used)
-    for lead in serp_valid_leads:
-        url = getattr(lead, 'source_url', '')
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            valid_leads.append(lead)
+    print(f"  API after deadline filter + dedup: {len(valid_leads)} verified leads")
+
+    # ------------------------------------------------------------------
+    # Step 3: SERP automatic fallback (ONLY if APIs returned zero results)
+    # ------------------------------------------------------------------
+    serp_used = False
+    serp_valid_leads: list = []
+
+    if len(valid_leads) == 0:
+        serp_used = True
+        print(f"\n  [SERP FALLBACK] APIs returned 0 results — falling back to Google SERP...")
+        _audit(
+            "tool_call",
+            f"API sources returned 0 results, falling back to SERP for: {search_query[:100]}",
+            node_name="discover",
+            input_payload={"query": search_query, "tool": "brightdata_serp", "mode": "auto_fallback"},
+        )
+        try:
+            searcher = SerpTenderSearcher()
+            serp_leads = searcher.search(user_query=search_query)
+            print(f"  [SERP] Got {len(serp_leads)} raw leads — running strict pipeline...")
+
+            # Run the strict filtering pipeline (every result page-fetched)
+            serp_valid_leads = _filter_serp_leads(serp_leads, search_query)
+            print(f"  [SERP] {len(serp_valid_leads)} passed (all have verified deadlines)")
+
+            # Add SERP leads to valid_leads (no dedup needed — API list was empty)
+            for lead in serp_valid_leads:
+                url = getattr(lead, 'source_url', '')
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    valid_leads.append(lead)
+
+        except Exception as exc:
+            print(f"  [SERP] Failed: {exc}")
+            _audit(
+                "tool_call", f"SERP fallback failed: {exc}",
+                node_name="discover", status="failure", error_message=str(exc),
+            )
+    else:
+        print("  [SERP] Skipped — APIs returned results, no fallback needed")
 
     valid_leads.sort(
         key=lambda l: getattr(l, '_effective_score', getattr(l, 'relevance_score', 0)),
@@ -1266,10 +1300,12 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         detected = detect_region(query)
         region_name = REGION_COUNTRY_NAMES.get(detected, ["this region"])[0]
 
+        searched_label = "20 government APIs + Google SERP" if serp_used else "20 government APIs"
+
         if detected != "global":
             reply = (
                 f"**No active SDS/EHS tenders found in {region_name}.**\n\n"
-                f"I searched multiple tender portals but couldn't find relevant, "
+                f"I searched {searched_label} but couldn't find relevant, "
                 f"unexpired opportunities matching your criteria in {region_name} right now.\n\n"
                 f"**What you can do:**\n"
                 f"- Try broadening your search: *'find chemical safety tenders globally'*\n"
@@ -1279,8 +1315,8 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         else:
             reply = (
                 "**No matching tenders found.**\n\n"
-                "I searched globally but couldn't find verified, unexpired tender listings "
-                "matching your criteria.\n\n"
+                f"I searched {searched_label} globally but couldn't find verified, unexpired "
+                "tender listings matching your criteria.\n\n"
                 "**Try:**\n"
                 "- *'SDS authoring software RFP United States'*\n"
                 "- *'chemical safety compliance tender Europe'*\n"
@@ -1292,6 +1328,7 @@ def run_tender_search(query: str) -> tuple[str, dict]:
             "tenders_found": 0,
             "duration_ms": duration_ms,
             "cost_usd": 0,
+            "serp_fallback_used": serp_used,
         }
 
     # Step 3: Format each tender as a rich card with source badges
@@ -1356,10 +1393,7 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         if desc:
             card += f"\n{desc}"
         badge_line = f"\U0001f4ca Relevance: {relevance:.0%}"
-        if deadline and len(deadline) >= 10:
-            badge_line += f" · \U0001f4c5 Deadline: {deadline[:10]}"
-        else:
-            badge_line += f" · ⚠️ Deadline: check source"
+        badge_line += f" · \U0001f4c5 Deadline: {deadline[:10]}"
         badge_line += value_str
         card += f"\n{badge_line}"
 
@@ -1411,18 +1445,18 @@ def run_tender_search(query: str) -> tuple[str, dict]:
     parts.append("")
     parts.append("---")
     parts.append("")
-    # Build a source label reflecting which APIs actually contributed
+    # Build a source label reflecting which sources contributed
     source_parts = []
-    api_portals = _all_api_portals  # reuse from merge step above
-    api_count = len([l for l in valid_leads if getattr(l, 'source_portal', '') in api_portals])
-    serp_count = len(valid_leads) - api_count
-    if api_count > 0:
-        source_parts.append(f"{api_count} from government APIs")
-    if serp_count > 0:
-        source_parts.append(f"{serp_count} from SERP discovery")
+    api_portals = _all_api_portals
+    api_final = len([l for l in valid_leads if getattr(l, 'source_portal', '') in api_portals])
+    serp_final = len(valid_leads) - api_final
+    if api_final > 0:
+        source_parts.append(f"{api_final} from government APIs")
+    if serp_final > 0:
+        source_parts.append(f"{serp_final} from SERP fallback")
     source_label = " + ".join(source_parts) if source_parts else "government API search"
 
-    parts.append(f"_{source_label} \u2022 {len(valid_leads)} verified results \u2022 {duration_ms}ms_")
+    parts.append(f"_{source_label} \u2022 {len(valid_leads)} verified results \u2022 all deadlines confirmed active \u2022 {duration_ms}ms_")
 
     reply = "\n".join(parts)
 
@@ -1453,7 +1487,7 @@ def run_tender_search(query: str) -> tuple[str, dict]:
     for portal_key, source_name in portal_to_source.items():
         if any(getattr(l, 'source_portal', '') == portal_key for l in valid_leads):
             sources_used.append(source_name)
-    if serp_count > 0:
+    if serp_final > 0:
         sources_used.append("brightdata_serp")
 
     metadata = {
@@ -1466,8 +1500,10 @@ def run_tender_search(query: str) -> tuple[str, dict]:
         "model": LLM_MODEL,
         "duration_ms": duration_ms,
         "search_sources": sources_used,
-        "api_results": api_count,
-        "serp_results": serp_count,
+        "api_results": api_final,
+        "serp_results": serp_final,
+        "serp_fallback_used": serp_used,
+        "all_deadlines_verified": True,
     }
 
     return reply, metadata

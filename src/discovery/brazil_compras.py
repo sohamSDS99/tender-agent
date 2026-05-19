@@ -40,19 +40,32 @@ logger = structlog.get_logger(__name__)
 # API endpoints (tried in order until one responds)
 # ---------------------------------------------------------------------------
 
-COMPRAS_BASE_URL = "https://dadosabertos.compras.gov.br"
+# PNCP is Brazil's new national procurement portal (Portal Nacional de
+# Contratações Públicas). The old dadosabertos.compras.gov.br endpoints
+# returned 404 across the board as of May 2026 — every municipality and
+# federal entity now publishes to PNCP centrally. Confirmed live via the
+# PNCP Swagger at https://pncp.gov.br/api/consulta/v3/api-docs.
+COMPRAS_BASE_URL = "https://pncp.gov.br"
 
-# Candidate paths — the first one that returns a valid JSON response wins
-_CANDIDATE_PATHS: list[str] = [
-    "/modulo-pncp/1_consultarContratacao",
-    "/modulo-contratacao/1_consultarContratacao",
-    "/ocds/releases",
-    "/modulo-pncp/consultarContratacao",
-    "/modulo-contratacao/consultarContratacao",
+# The /contratacoes/publicacao endpoint requires:
+#   dataInicial, dataFinal: yyyyMMdd (single-day or range, max 365d apart)
+#   codigoModalidadeContratacao: integer 1-14 (procurement method)
+#   pagina: page number starting at 1
+#   tamanhoPagina: min 10, max 50
+_PNCP_ENDPOINT = "/api/consulta/v1/contratacoes/publicacao"
+
+# PNCP responsiveness is intermittent — modalidade 4 (Concorrência) is
+# the only one that responds within 12s reliably (verified May 2026).
+# Pregão (6) and Dispensa (8) time out >45s. Diálogo competitivo (13)
+# is hit-and-miss. Stick to 4 and accept the occasional Brazilian
+# coverage gap rather than dragging the whole search wall time up.
+_PNCP_MODALIDADES: list[int] = [
+    4,   # Concorrência eletrônica — most reliable + most relevant
 ]
 
-# Public web view for a single procurement notice
-PNCP_NOTICE_URL_TEMPLATE = "https://pncp.gov.br/app/editais/{notice_id}"
+# Public web view for a single procurement notice. The PNCP URL pattern
+# is /app/editais/{agency_cnpj}/{ano}/{sequencial}.
+PNCP_NOTICE_URL_TEMPLATE = "https://pncp.gov.br/app/editais/{cnpj}/{ano}/{seq}"
 
 # ---------------------------------------------------------------------------
 # Country-specific keywords (Portuguese + English)
@@ -79,6 +92,7 @@ EXTRA_PARTIAL_KEYWORDS: list[str] = [
 # ---------------------------------------------------------------------------
 
 _TITLE_FIELDS: list[str] = [
+    "objetoCompra",           # PNCP primary field
     "objetoContratacao",
     "objeto",
     "descricao",
@@ -87,8 +101,10 @@ _TITLE_FIELDS: list[str] = [
 ]
 
 _DESCRIPTION_FIELDS: list[str] = [
+    "informacaoComplementar",  # PNCP primary field
     "descricao",
     "informacoesComplementares",
+    "objetoCompra",
     "objetoContratacao",
     "objeto",
 ]
@@ -102,14 +118,15 @@ _AGENCY_FIELDS: list[str] = [
 ]
 
 _DEADLINE_FIELDS: list[str] = [
+    "dataEncerramentoProposta",  # PNCP primary field
     "dataLimite",
     "dataHoraLimitePropostas",
     "dataFimVigencia",
-    "dataEncerramentoProposta",
     "dataFimRecebimentoPropostas",
 ]
 
 _POSTED_FIELDS: list[str] = [
+    "dataPublicacaoPncp",        # PNCP primary field (correct casing)
     "dataPublicacao",
     "dataPublicacaoPNCP",
     "dataAbertura",
@@ -180,7 +197,12 @@ class BrazilComprasSearcher:
 
     def __init__(
         self,
-        timeout: float = 30.0,
+        # PNCP latency is genuinely intermittent — sometimes <2s,
+        # sometimes >45s for the same query. Cap at 12s so a slow PNCP
+        # run doesn't monopolise the bridge's parallel-fan-out worker
+        # budget. We'd rather miss this source on a slow day than have
+        # every search block waiting for it.
+        timeout: float = 12.0,
         min_relevance: float = 0.10,
     ) -> None:
         """Initialise the searcher.
@@ -358,67 +380,83 @@ class BrazilComprasSearcher:
     def _fetch_tenders(
         self,
         days_back: int = 60,
-        page_size: int = 100,
-        max_pages: int = 3,
+        page_size: int = 50,
+        # One page per modalidade keeps total wall time bounded even if
+        # PNCP is in a slow mode. The first 50 records per modalidade
+        # is more than enough — relevance scoring caps results anyway.
+        max_pages: int = 1,
     ) -> list[dict[str, Any]]:
-        """Fetch tender records from the Compras.gov.br API.
+        """Fetch tender records from PNCP (Portal Nacional de Contratações Públicas).
 
-        Probes multiple API paths and paginates up to *max_pages*.
+        PNCP requires dataInicial+dataFinal in yyyyMMdd and a specific
+        codigoModalidadeContratacao. We loop over a small set of modalidades
+        most likely to contain SDS/EHS-relevant contracts. tamanhoPagina has
+        a server-side minimum of 10 and maximum of 50.
 
         Args:
-            days_back: Number of days back (unused in query but kept for
-                consistency — filtering is done post-fetch).
-            page_size: Number of records per page.
-            max_pages: Maximum number of pages to fetch.
+            days_back: Number of days back to search.
+            page_size: Records per page (clamped to PNCP's 10-50 range).
+            max_pages: Max pages per modalidade to avoid runaway queries.
 
         Returns:
-            Flat list of record dicts (OCDS releases or custom objects).
+            Flat list of PNCP record dicts.
         """
-        all_records: list[dict[str, Any]] = []
+        # PNCP date format is yyyyMMdd, single-day or range up to 365 days.
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=max(days_back, 1))
+        data_inicial = start.strftime("%Y%m%d")
+        data_final = now.strftime("%Y%m%d")
 
-        headers: dict[str, str] = {
-            "Accept": "application/json",
-        }
+        # Server-side: 10 <= tamanhoPagina <= 50
+        page_size = max(10, min(50, page_size))
+
+        all_records: list[dict[str, Any]] = []
+        headers: dict[str, str] = {"Accept": "application/json"}
 
         with httpx.Client(timeout=self.timeout, headers=headers, follow_redirects=True) as client:
-            for page_num in range(1, max_pages + 1):
-                params: dict[str, str] = {
-                    "pagina": str(page_num),
-                    "tamanhoPagina": str(page_size),
-                }
+            for modalidade in _PNCP_MODALIDADES:
+                for page_num in range(1, max_pages + 1):
+                    params: dict[str, str] = {
+                        "dataInicial": data_inicial,
+                        "dataFinal": data_final,
+                        "codigoModalidadeContratacao": str(modalidade),
+                        "pagina": str(page_num),
+                        "tamanhoPagina": str(page_size),
+                    }
 
-                try:
-                    result = self._discover_endpoint(client, params)
-                    if result is None:
-                        logger.warning(
-                            "brazil_compras_no_working_endpoint",
+                    try:
+                        url = f"{COMPRAS_BASE_URL}{_PNCP_ENDPOINT}"
+                        resp = client.get(url, params=params)
+                        if resp.status_code == 204:
+                            # No data for this modalidade — move on.
+                            break
+                        resp.raise_for_status()
+                        data = resp.json()
+
+                        records = data.get("data") if isinstance(data, dict) else None
+                        if not isinstance(records, list) or not records:
+                            break
+
+                        all_records.extend(records)
+                        logger.debug(
+                            "brazil_compras_page_fetched",
+                            modalidade=modalidade,
                             page=page_num,
+                            count=len(records),
+                        )
+
+                        # If fewer than page_size, that was the last page
+                        if len(records) < page_size:
+                            break
+
+                    except Exception as exc:
+                        logger.debug(
+                            "brazil_compras_page_error",
+                            modalidade=modalidade,
+                            page=page_num,
+                            error=str(exc),
                         )
                         break
-
-                    _path, records = result
-
-                    if not isinstance(records, list):
-                        break
-
-                    all_records.extend(records)
-                    logger.debug(
-                        "brazil_compras_page_fetched",
-                        page=page_num,
-                        count=len(records),
-                    )
-
-                    # If fewer records than page size, no more pages
-                    if len(records) < page_size:
-                        break
-
-                except Exception as exc:
-                    logger.error(
-                        "brazil_compras_page_error",
-                        page=page_num,
-                        error=str(exc),
-                    )
-                    break
 
         return all_records
 
@@ -472,28 +510,25 @@ class BrazilComprasSearcher:
     ) -> OcdsTenderLead | None:
         """Parse a Brazil custom-format record into an ``OcdsTenderLead``.
 
-        Maps Portuguese field names (``objetoContratacao``,
-        ``valorTotalEstimado``, ``dataLimite``, etc.) to the shared
-        dataclass.
-
-        Args:
-            record: A single custom-format JSON object.
-
-        Returns:
-            An ``OcdsTenderLead`` or ``None`` if the record is
-            unparseable.
+        Handles both legacy Compras.gov.br objects and the current PNCP
+        v1 shape (which nests the buying organisation under
+        ``orgaoEntidade`` and identifies tenders by the compound key
+        ``{cnpj}/{anoCompra}/{sequencialCompra}``).
         """
         title = _first_nonempty(record, _TITLE_FIELDS)
         if not title:
             return None
 
         description = _first_nonempty(record, _DESCRIPTION_FIELDS)
-        # Avoid duplicating title as description
         if description == title:
             description = ""
 
+        # PNCP shape: agency name nested under orgaoEntidade.razaoSocial.
+        # Fall back to the flat-name lookup for legacy shapes.
+        orgao = record.get("orgaoEntidade") if isinstance(record.get("orgaoEntidade"), dict) else None
         agency = (
-            _first_nonempty(record, _AGENCY_FIELDS)
+            (orgao or {}).get("razaoSocial")
+            or _first_nonempty(record, _AGENCY_FIELDS)
             or "Governo Federal do Brasil"
         )
 
@@ -503,18 +538,24 @@ class BrazilComprasSearcher:
         value_amount = _first_numeric(record, _VALUE_FIELDS)
         currency = _first_nonempty(record, _CURRENCY_FIELDS) or "BRL"
 
-        # Build source URL
-        record_id = _first_nonempty(record, _ID_FIELDS)
+        # Source URL: prefer PNCP's compound identifier when present.
         source_url = ""
-        if record_id:
+        record_id = _first_nonempty(record, _ID_FIELDS)
+        ano = record.get("anoCompra")
+        seq = record.get("sequencialCompra")
+        cnpj = (orgao or {}).get("cnpj")
+        if ano and seq and cnpj:
             source_url = PNCP_NOTICE_URL_TEMPLATE.format(
-                notice_id=record_id,
+                cnpj=cnpj, ano=ano, seq=seq,
             )
+            # PNCP's natural unique key for the record
+            if not record_id:
+                record_id = f"{cnpj}-{ano}-{seq}"
+        elif record_id and "{notice_id}" in PNCP_NOTICE_URL_TEMPLATE:
+            # Legacy shape — keep working if the template ever reverts
+            source_url = PNCP_NOTICE_URL_TEMPLATE.format(notice_id=record_id)
 
-        # Build a stable lead ID
-        lead_id = record_id
-        if not lead_id:
-            lead_id = f"BRCMP-{uuid.uuid4().hex[:8].upper()}"
+        lead_id = record_id or f"BRCMP-{uuid.uuid4().hex[:8].upper()}"
 
         # Parse dates
         deadline_iso = _parse_date(deadline_raw)

@@ -38,11 +38,15 @@ logger = structlog.get_logger(__name__)
 # API endpoints — tried in order until one returns HTTP 200
 # ---------------------------------------------------------------------------
 
+# Verified working endpoint as of May 2026 (per the live Swagger spec at
+# https://ocds-api.etenders.gov.za/swagger/v1/swagger.json). The API
+# expects dateFrom/dateTo (yyyy-MM-dd) plus PageNumber/PageSize.
 SA_ETENDER_ENDPOINTS: list[str] = [
+    "https://ocds-api.etenders.gov.za/api/OCDSReleases",
+    # Legacy fallbacks kept so a regression on the primary host falls
+    # through to known-bad paths rather than immediate empty results.
     "https://ocds-api.etenders.gov.za/api/ocds/releases",
     "https://ocds-api.etenders.gov.za/releases",
-    "https://ocds-api.etenders.gov.za/api/releases",
-    "https://ocds-api.etenders.gov.za/api/ocds/release-packages",
 ]
 
 # Public web view base
@@ -179,14 +183,18 @@ class SaEtenderSearcher:
         now = datetime.now(timezone.utc)
         from_date = now - timedelta(days=days_back)
 
-        from_str = from_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-        to_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # Common query parameters for date filtering and pagination
+        # The primary endpoint uses dateFrom/dateTo + PageNumber/PageSize;
+        # the legacy fallbacks accepted since/from/to + page/limit. Send
+        # both styles in one params dict — extra params are ignored
+        # server-side, missing required ones still get 400'd. Cheap.
         params: dict[str, str] = {
-            "since": from_str,
-            "from": from_str,
-            "to": to_str,
+            "dateFrom": from_date.strftime("%Y-%m-%d"),
+            "dateTo": now.strftime("%Y-%m-%d"),
+            "PageNumber": "1",
+            "PageSize": "200",
+            "since": from_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "from": from_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "publishedFrom": from_date.strftime("%Y-%m-%d"),
             "publishedTo": now.strftime("%Y-%m-%d"),
             "page": "1",

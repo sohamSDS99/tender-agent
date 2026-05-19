@@ -1094,32 +1094,40 @@ def run_tender_search(filters: dict) -> dict:
     # someone finds the new endpoint URL and patches the corresponding
     # discovery module.
     #
-    # Investigation notes (so the next person doesn't re-do this work):
-    #   germany_bkms:     oeffentlichevergabe.de returns 404 on every /api
-    #                     path; the OCDS feed appears to have been removed.
-    #   brazil_compras:   dadosabertos.compras.gov.br returns 404 on every
-    #                     known path; portal migrated to gov.br/compras
-    #                     without a public OCDS feed yet.
-    #   mexico_cdmx:      tianguisdigital.cdmx.gob.mx returns 404 on every
-    #                     path; CDMX migrated to a new portal in 2025.
-    #   italy_anac:       dati.anticorruzione.it now serves Superset UI at
-    #                     /api/* paths instead of CKAN JSON.
-    #   sa_etender:       ocds-api.etenders.gov.za 404s; the OCDS feed
-    #                     appears to have moved or been disabled.
-    #   peru_oece:        contratacionesabiertas.oece.gob.pe returns 403
-    #                     on every path — likely IP-restricted now.
-    #   uganda_gpp:       gpp.ppda.go.ug returns HTML instead of JSON on
-    #                     every /api/* path; OCDS feed appears retired.
-    #   dominican_dgcp:   datosabiertos.dgcp.gob.do returns HTML page now.
+    # Investigation notes per source — last verified May 2026:
+    #   germany_bkms:   oeffentlichevergabe.de /api/* paths all 404. The
+    #                   BMI's published OCDS migration ("since Dec 16,
+    #                   2025") doesn't yet have a discoverable public
+    #                   endpoint. Recheck BMI dev portal in a few months.
+    #   mexico_cdmx:    tianguisdigital.cdmx.gob.mx /api/* paths all 404
+    #                   and the public web UI doesn't expose a JSON feed.
+    #                   CDMX migrated to a new portal in 2025 with no
+    #                   API yet.
+    #   italy_anac:     dati.anticorruzione.it/opendata/* returns 269-byte
+    #                   HTML stubs to bots (WAF-protected). The OCDS
+    #                   dataset is downloadable as bulk JSON/CSV but no
+    #                   query API; not viable for live polling.
+    #   peru_oece:      contratacionesabiertas.oece.gob.pe returns 403 on
+    #                   every path (looks IP-restricted). osce.gob.pe
+    #                   returns HTML login pages.
+    #   uganda_gpp:     gpp.ppda.go.ug returns HTML on every /api/* path;
+    #                   the OCDS feed appears to have been retired.
+    #   dominican_dgcp: api.dgcp.gob.do is documented but unreachable
+    #                   (connection refused / DNS unstable as of probe).
+    #
+    # REVIVED (May 2026) and removed from this list:
+    #   brazil_compras: migrated from dadosabertos.compras.gov.br to the
+    #                   new PNCP portal at pncp.gov.br — module updated.
+    #   sa_etender:     ocds-api.etenders.gov.za still works, the JSON
+    #                   path is /api/OCDSReleases (Swagger-confirmed) —
+    #                   module updated.
     KNOWN_BROKEN_APIS = {
         "germany_bkms":   "404 on every known endpoint path",
-        "brazil_compras": "portal migrated; no public OCDS feed found",
         "mexico_cdmx":    "tianguisdigital migrated; new feed unknown",
-        "italy_anac":     "dati.anticorruzione.it now serves Superset UI",
-        "sa_etender":     "OCDS endpoint 404",
+        "italy_anac":     "dati.anticorruzione.it WAF returns HTML stubs",
         "peru_oece":      "403 on every path (IP-restricted?)",
         "uganda_gpp":     "OCDS endpoint returns HTML",
-        "dominican_dgcp": "datosabiertos.dgcp.gob.do returns HTML",
+        "dominican_dgcp": "api.dgcp.gob.do unreachable",
     }
 
     api_jobs = []

@@ -1038,311 +1038,119 @@ def run_tender_search(filters: dict) -> dict:
     api_leads: list = []
 
     # ------------------------------------------------------------------
-    # Step 1: Direct API sources (structured, reliable). Each block is
-    # gated by both region_match(...) AND src_on(source_name) so a user
-    # can disable individual portals via the filter form.
+    # Step 1: Direct API sources, fanned out in PARALLEL.
+    # Each tuple = (source_name, region_gate, source_gate, callable).
+    # We build the list first so we can submit only the ones that match
+    # region/source filters, then call them concurrently via a thread pool.
+    # Wall time goes from ~60s serial to ~10-15s parallel since these are
+    # all I/O bound.
     # ------------------------------------------------------------------
-
-    # TED Europa
-    if region_match("europe", "uk", "global") and src_on("ted_europa"):
-        try:
-            print("  [TED API] Querying TED Europa for active EU tenders...")
-            ted_leads = TedEuropaSearcher().search(user_query=search_query, max_results=15)
-            api_leads.extend(ted_leads)
-            print(f"  [TED API] Got {len(ted_leads)} structured results")
-            _audit("tool_call", f"TED Europa API returned {len(ted_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "ted_europa", "count": len(ted_leads)})
-        except Exception as exc:
-            print(f"  [TED API] Failed: {exc}")
-            _audit("tool_call", f"TED Europa API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # UK Contracts Finder + Find a Tender
-    if region_match("uk", "europe", "global") and src_on("uk_tenders"):
-        try:
-            print("  [UK API] Querying Contracts Finder + Find a Tender...")
-            uk_leads = UkTenderSearcher().search(user_query=search_query, max_results=15, days_back=60)
-            api_leads.extend(uk_leads)
-            print(f"  [UK API] Got {len(uk_leads)} relevant UK tenders")
-            _audit("tool_call", f"UK Tenders API returned {len(uk_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "uk_tenders", "count": len(uk_leads)})
-        except Exception as exc:
-            print(f"  [UK API] Failed: {exc}")
-            _audit("tool_call", f"UK Tenders API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # SAM.gov
     sam_api_key = os.getenv("SAM_GOV_API_KEY", "")
+
+    def _ted():
+        return TedEuropaSearcher().search(user_query=search_query, max_results=15)
+    def _uk():
+        return UkTenderSearcher().search(user_query=search_query, max_results=15, days_back=60)
+    def _sam():
+        return SamGovScraper(dry_run=False).fetch_opportunities(days_back=30)
+    def _boamp():
+        return BoampSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _wb():
+        return WorldBankSearcher().search(user_query=search_query, max_results=10, days_back=90)
+    def _prozorro():
+        return ProzorroSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _canada():
+        return CanadaBuysSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _austender():
+        return AusTenderSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _sa():
+        return SaEtenderSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _colombia():
+        return ColombiaSecopSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _brazil():
+        return BrazilComprasSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _germany():
+        return GermanyBkmsSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _italy():
+        return ItalyAnacSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _dr():
+        return DominicanDgcpSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _peru():
+        return PeruOeceSearcher().search(user_query=search_query, max_results=10, days_back=90)
+    def _wb2():
+        return WorldBankV2Searcher().search(user_query=search_query, max_results=10)
+    def _nigeria():
+        return NigeriaNocopoSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _kenya():
+        return KenyaPpraSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _uganda():
+        return UgandaGppSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _mexico():
+        return MexicoCdmxSearcher().search(user_query=search_query, max_results=10, days_back=60)
+
+    api_jobs = []
+    if region_match("europe", "uk", "global") and src_on("ted_europa"):
+        api_jobs.append(("ted_europa", _ted))
+    if region_match("uk", "europe", "global") and src_on("uk_tenders"):
+        api_jobs.append(("uk_tenders", _uk))
     if region_match("usa", "global") and src_on("sam_gov") and sam_api_key:
-        try:
-            print("  [SAM API] Querying SAM.gov for active US tenders...")
-            sam_leads = SamGovScraper(dry_run=False).fetch_opportunities(days_back=30)
-            api_leads.extend(sam_leads)
-            print(f"  [SAM API] Got {len(sam_leads)} structured results")
-            _audit("tool_call", f"SAM.gov API returned {len(sam_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "sam_gov", "count": len(sam_leads)})
-        except Exception as exc:
-            print(f"  [SAM API] Failed: {exc}")
+        api_jobs.append(("sam_gov", _sam))
     elif region_match("usa", "global") and src_on("sam_gov") and not sam_api_key:
         print("  [SAM API] Skipped — SAM_GOV_API_KEY not set")
-
-    # BOAMP France
     if region_match("europe", "global") and src_on("boamp_france"):
-        try:
-            print("  [BOAMP API] Querying French BOAMP for active tenders...")
-            boamp_leads = BoampSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(boamp_leads)
-            print(f"  [BOAMP API] Got {len(boamp_leads)} relevant French tenders")
-            _audit("tool_call", f"BOAMP API returned {len(boamp_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "boamp_france", "count": len(boamp_leads)})
-        except Exception as exc:
-            print(f"  [BOAMP API] Failed: {exc}")
-            _audit("tool_call", f"BOAMP API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # World Bank v1
+        api_jobs.append(("boamp_france", _boamp))
     if region_match("global", "india", "australia") and src_on("world_bank"):
-        try:
-            print("  [World Bank API] Querying World Bank procurement notices...")
-            wb_leads = WorldBankSearcher().search(user_query=search_query, max_results=10, days_back=90)
-            api_leads.extend(wb_leads)
-            print(f"  [World Bank API] Got {len(wb_leads)} relevant tenders")
-            _audit("tool_call", f"World Bank API returned {len(wb_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "world_bank", "count": len(wb_leads)})
-        except Exception as exc:
-            print(f"  [World Bank API] Failed: {exc}")
-            _audit("tool_call", f"World Bank API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Prozorro
+        api_jobs.append(("world_bank", _wb))
     if region_match("europe", "global") and src_on("prozorro"):
-        try:
-            print("  [Prozorro API] Querying Ukrainian Prozorro for active tenders...")
-            prozorro_leads = ProzorroSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(prozorro_leads)
-            print(f"  [Prozorro API] Got {len(prozorro_leads)} relevant Ukrainian tenders")
-            _audit("tool_call", f"Prozorro API returned {len(prozorro_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "prozorro", "count": len(prozorro_leads)})
-        except Exception as exc:
-            print(f"  [Prozorro API] Failed: {exc}")
-            _audit("tool_call", f"Prozorro API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # CanadaBuys
+        api_jobs.append(("prozorro", _prozorro))
     if region_match("canada", "usa", "global") and src_on("canada_buys"):
-        try:
-            print("  [CanadaBuys API] Querying Canadian procurement data...")
-            canada_leads = CanadaBuysSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(canada_leads)
-            print(f"  [CanadaBuys API] Got {len(canada_leads)} relevant Canadian tenders")
-            _audit("tool_call", f"CanadaBuys API returned {len(canada_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "canada_buys", "count": len(canada_leads)})
-        except Exception as exc:
-            print(f"  [CanadaBuys API] Failed: {exc}")
-            _audit("tool_call", f"CanadaBuys API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # AusTender
+        api_jobs.append(("canada_buys", _canada))
     if region_match("australia", "global") and src_on("austender"):
-        try:
-            print("  [AusTender API] Querying Australian federal tenders...")
-            aus_leads = AusTenderSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(aus_leads)
-            print(f"  [AusTender API] Got {len(aus_leads)} relevant Australian tenders")
-            _audit("tool_call", f"AusTender API returned {len(aus_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "austender", "count": len(aus_leads)})
-        except Exception as exc:
-            print(f"  [AusTender API] Failed: {exc}")
-            _audit("tool_call", f"AusTender API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # SA eTender
+        api_jobs.append(("austender", _austender))
     if region_match("africa", "global") and src_on("sa_etender"):
-        try:
-            print("  [SA eTender API] Querying South African government tenders...")
-            sa_leads = SaEtenderSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(sa_leads)
-            print(f"  [SA eTender API] Got {len(sa_leads)} relevant South African tenders")
-            _audit("tool_call", f"SA eTender API returned {len(sa_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "sa_etender", "count": len(sa_leads)})
-        except Exception as exc:
-            print(f"  [SA eTender API] Failed: {exc}")
-            _audit("tool_call", f"SA eTender API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Colombia SECOP
+        api_jobs.append(("sa_etender", _sa))
     if region_match("south_america", "global") and src_on("colombia_secop"):
-        try:
-            print("  [Colombia SECOP API] Querying Colombian procurement data...")
-            col_leads = ColombiaSecopSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(col_leads)
-            print(f"  [Colombia SECOP API] Got {len(col_leads)} relevant Colombian tenders")
-            _audit("tool_call", f"Colombia SECOP API returned {len(col_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "colombia_secop", "count": len(col_leads)})
-        except Exception as exc:
-            print(f"  [Colombia SECOP API] Failed: {exc}")
-            _audit("tool_call", f"Colombia SECOP API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Brazil Compras
+        api_jobs.append(("colombia_secop", _colombia))
     if region_match("south_america", "global") and src_on("brazil_compras"):
-        try:
-            print("  [Brazil Compras API] Querying Brazilian federal procurement...")
-            br_leads = BrazilComprasSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(br_leads)
-            print(f"  [Brazil Compras API] Got {len(br_leads)} relevant Brazilian tenders")
-            _audit("tool_call", f"Brazil Compras API returned {len(br_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "brazil_compras", "count": len(br_leads)})
-        except Exception as exc:
-            print(f"  [Brazil Compras API] Failed: {exc}")
-            _audit("tool_call", f"Brazil Compras API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Germany BKMS
+        api_jobs.append(("brazil_compras", _brazil))
     if region_match("europe", "global") and src_on("germany_bkms"):
-        try:
-            print("  [Germany BKMS API] Querying German federal procurement...")
-            de_leads = GermanyBkmsSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(de_leads)
-            print(f"  [Germany BKMS API] Got {len(de_leads)} relevant German tenders")
-            _audit("tool_call", f"Germany BKMS API returned {len(de_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "germany_bkms", "count": len(de_leads)})
-        except Exception as exc:
-            print(f"  [Germany BKMS API] Failed: {exc}")
-            _audit("tool_call", f"Germany BKMS API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Italy ANAC
+        api_jobs.append(("germany_bkms", _germany))
     if region_match("europe", "global") and src_on("italy_anac"):
-        try:
-            print("  [Italy ANAC API] Querying Italian public procurement...")
-            it_leads = ItalyAnacSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(it_leads)
-            print(f"  [Italy ANAC API] Got {len(it_leads)} relevant Italian tenders")
-            _audit("tool_call", f"Italy ANAC API returned {len(it_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "italy_anac", "count": len(it_leads)})
-        except Exception as exc:
-            print(f"  [Italy ANAC API] Failed: {exc}")
-            _audit("tool_call", f"Italy ANAC API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Dominican DGCP
+        api_jobs.append(("italy_anac", _italy))
     if region_match("south_america", "global") and src_on("dominican_dgcp"):
-        try:
-            print("  [Dominican DGCP API] Querying Dominican Republic procurement...")
-            dr_leads = DominicanDgcpSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(dr_leads)
-            print(f"  [Dominican DGCP API] Got {len(dr_leads)} relevant Dominican tenders")
-            _audit("tool_call", f"Dominican DGCP API returned {len(dr_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "dominican_dgcp", "count": len(dr_leads)})
-        except Exception as exc:
-            print(f"  [Dominican DGCP API] Failed: {exc}")
-            _audit("tool_call", f"Dominican DGCP API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Peru OECE
+        api_jobs.append(("dominican_dgcp", _dr))
     if region_match("south_america", "global") and src_on("peru_oece"):
-        try:
-            print("  [Peru OECE API] Querying Peruvian procurement data...")
-            pe_leads = PeruOeceSearcher().search(user_query=search_query, max_results=10, days_back=90)
-            api_leads.extend(pe_leads)
-            print(f"  [Peru OECE API] Got {len(pe_leads)} relevant Peruvian tenders")
-            _audit("tool_call", f"Peru OECE API returned {len(pe_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "peru_oece", "count": len(pe_leads)})
-        except Exception as exc:
-            print(f"  [Peru OECE API] Failed: {exc}")
-            _audit("tool_call", f"Peru OECE API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # World Bank v2
+        api_jobs.append(("peru_oece", _peru))
     if region_match("global", "india", "africa", "australia") and src_on("world_bank_v2"):
-        try:
-            print("  [WB Search v2 API] Querying World Bank procurement notices (keyword search)...")
-            wb2_leads = WorldBankV2Searcher().search(user_query=search_query, max_results=10)
-            api_leads.extend(wb2_leads)
-            print(f"  [WB Search v2 API] Got {len(wb2_leads)} relevant World Bank tenders")
-            _audit("tool_call", f"World Bank v2 API returned {len(wb2_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "world_bank_v2", "count": len(wb2_leads)})
-        except Exception as exc:
-            print(f"  [WB Search v2 API] Failed: {exc}")
-            _audit("tool_call", f"World Bank v2 API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Nigeria NOCOPO
+        api_jobs.append(("world_bank_v2", _wb2))
     if region_match("africa", "global") and src_on("nigeria_nocopo"):
-        try:
-            print("  [Nigeria NOCOPO API] Querying Nigerian federal procurement...")
-            ng_leads = NigeriaNocopoSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(ng_leads)
-            print(f"  [Nigeria NOCOPO API] Got {len(ng_leads)} relevant Nigerian tenders")
-            _audit("tool_call", f"Nigeria NOCOPO API returned {len(ng_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "nigeria_nocopo", "count": len(ng_leads)})
-        except Exception as exc:
-            print(f"  [Nigeria NOCOPO API] Failed: {exc}")
-            _audit("tool_call", f"Nigeria NOCOPO API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Kenya PPRA
+        api_jobs.append(("nigeria_nocopo", _nigeria))
     if region_match("africa", "global") and src_on("kenya_ppra"):
-        try:
-            print("  [Kenya PPRA API] Querying Kenyan government tenders...")
-            ke_leads = KenyaPpraSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(ke_leads)
-            print(f"  [Kenya PPRA API] Got {len(ke_leads)} relevant Kenyan tenders")
-            _audit("tool_call", f"Kenya PPRA API returned {len(ke_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "kenya_ppra", "count": len(ke_leads)})
-        except Exception as exc:
-            print(f"  [Kenya PPRA API] Failed: {exc}")
-            _audit("tool_call", f"Kenya PPRA API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Uganda GPP
+        api_jobs.append(("kenya_ppra", _kenya))
     if region_match("africa", "global") and src_on("uganda_gpp"):
-        try:
-            print("  [Uganda GPP API] Querying Ugandan government procurement...")
-            ug_leads = UgandaGppSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(ug_leads)
-            print(f"  [Uganda GPP API] Got {len(ug_leads)} relevant Ugandan tenders")
-            _audit("tool_call", f"Uganda GPP API returned {len(ug_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "uganda_gpp", "count": len(ug_leads)})
-        except Exception as exc:
-            print(f"  [Uganda GPP API] Failed: {exc}")
-            _audit("tool_call", f"Uganda GPP API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
-
-    # Mexico City CDMX
+        api_jobs.append(("uganda_gpp", _uganda))
     if region_match("south_america", "global") and src_on("mexico_cdmx"):
-        try:
-            print("  [Mexico CDMX API] Querying Mexico City procurement data...")
-            mx_leads = MexicoCdmxSearcher().search(user_query=search_query, max_results=10, days_back=60)
-            api_leads.extend(mx_leads)
-            print(f"  [Mexico CDMX API] Got {len(mx_leads)} relevant Mexico City tenders")
-            _audit("tool_call", f"Mexico CDMX API returned {len(mx_leads)} leads",
-                   node_name="discover", status="success",
-                   output_payload={"source": "mexico_cdmx", "count": len(mx_leads)})
-        except Exception as exc:
-            print(f"  [Mexico CDMX API] Failed: {exc}")
-            _audit("tool_call", f"Mexico CDMX API failed: {exc}",
-                   node_name="discover", status="failure", error_message=str(exc))
+        api_jobs.append(("mexico_cdmx", _mexico))
+
+    print(f"  Fanning out to {len(api_jobs)} APIs in parallel (max 10 workers)…")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        future_to_name = {pool.submit(fn): name for name, fn in api_jobs}
+        for future in as_completed(future_to_name, timeout=90):
+            name = future_to_name[future]
+            try:
+                leads = future.result() or []
+                api_leads.extend(leads)
+                print(f"  [{name}] Got {len(leads)} results")
+                _audit("tool_call", f"{name} returned {len(leads)} leads",
+                       node_name="discover", status="success",
+                       output_payload={"source": name, "count": len(leads)})
+            except Exception as exc:
+                print(f"  [{name}] Failed: {exc}")
+                _audit("tool_call", f"{name} failed: {exc}",
+                       node_name="discover", status="failure",
+                       error_message=str(exc))
+
 
     api_raw_count = len(api_leads)
     print(f"  API total: {api_raw_count} raw leads from direct government APIs")

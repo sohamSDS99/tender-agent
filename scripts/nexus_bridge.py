@@ -1007,6 +1007,13 @@ def run_tender_search(filters: dict) -> dict:
             "usa", "europe", "uk", "canada", "australia",
             "india", "africa", "south_america",
         }
+    else:
+        # Specific region(s) selected — still include the truly-global APIs
+        # (World Bank v1 + v2) so the user gets cross-jurisdictional coverage,
+        # not just one or two region-specific endpoints. Without this, picking
+        # e.g. "USA" only fires SAM.gov + CanadaBuys; if SAM is rate-limited
+        # or returns nothing, the user sees an empty inbox.
+        regions_filter = regions_filter | {"global"}
 
     sources_filter = set(filters.get("sources") or [])
     all_sources_allowed = not sources_filter

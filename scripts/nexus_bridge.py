@@ -631,7 +631,7 @@ def _filter_serp_leads(leads: list, query: str) -> list:
     today = datetime.now(timezone.utc).date()
     excluded_domains = get_excluded_domains_for_region(query)
 
-    MIN_RELEVANCE = 0.15
+    MIN_RELEVANCE = 0.30
 
     def classify_deadline_from_snippet(lead: object) -> str:
         """Quick check from snippet text only. Returns valid/expired/missing."""
@@ -1243,6 +1243,25 @@ def run_tender_search(query: str) -> tuple[str, dict]:
             valid_leads.append(lead)
 
     print(f"  API after deadline filter + dedup: {len(valid_leads)} verified leads")
+
+    # ------------------------------------------------------------------
+    # Step 2b: Relevance floor — block tenders without real SDS/EHS signal.
+    # A 15% score means only generic partial matches like "safety" or
+    # "waste" — not actually about chemical safety or SDS. Require 30%+
+    # which means at least 1 strong keyword or 6+ partial matches.
+    # ------------------------------------------------------------------
+    RELEVANCE_FLOOR = 0.30
+    before_relevance = len(valid_leads)
+    valid_leads = [
+        l for l in valid_leads
+        if getattr(l, 'relevance_score', 0) >= RELEVANCE_FLOOR
+    ]
+    blocked_irrelevant = before_relevance - len(valid_leads)
+    if blocked_irrelevant > 0:
+        print(f"  [Relevance gate] Blocked {blocked_irrelevant} leads below {RELEVANCE_FLOOR:.0%} "
+              f"(kept {len(valid_leads)} relevant)")
+    else:
+        print(f"  [Relevance gate] All {len(valid_leads)} leads above {RELEVANCE_FLOOR:.0%} floor")
 
     # ------------------------------------------------------------------
     # Step 3: SERP automatic fallback (ONLY if APIs returned zero results)

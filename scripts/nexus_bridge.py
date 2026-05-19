@@ -564,7 +564,7 @@ def is_valid_tender_link(url: str) -> bool:
 
 
 def _filter_serp_leads(leads: list, query: str) -> list:
-    """Run the 7-gate filtering pipeline on SERP results.
+    """Run the 8-gate filtering pipeline on SERP results.
 
     This is ONLY used in deep search mode. API results skip this entirely.
 
@@ -575,11 +575,15 @@ def _filter_serp_leads(leads: list, query: str) -> list:
       4. Reject empty portal pages
       5. Require tender signal (proof it's procurement, not news)
       6. Minimum relevance score
-      7. Deadline/freshness (expired/stale → block)
+      7. Deadline/freshness from snippet (expired/stale → block)
+      8. PAGE-FETCH VERIFICATION: for leads with no snippet deadline,
+         fetch the actual tender page to extract deadline + check if closed.
+         If the page reveals it's expired/closed → block it.
     """
     from dateutil import parser as dateparser
     from urllib.parse import urlparse
     from src.discovery.serp_search import extract_deadline_from_text
+    from src.discovery.deadline_verifier import verify_deadline
 
     today = datetime.now(timezone.utc).date()
     excluded_domains = get_excluded_domains_for_region(query)
@@ -594,6 +598,8 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             desc = getattr(lead, 'description', '') or ''
             title = getattr(lead, 'title', '') or ''
             deadline = extract_deadline_from_text(f"{title} {desc}")
+            if deadline:
+                lead.submission_deadline = deadline
         if deadline and len(deadline) >= 8:
             try:
                 parsed_date = dateparser.parse(deadline).date()
@@ -621,10 +627,13 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             return True
 
     valid = []
+    needs_page_verify: list = []  # Leads that passed gates 1-7 but have no deadline
     counts = {
         "blocked_url": 0, "blocked_region": 0, "no_strong_kw": 0,
         "empty_page": 0, "no_tender_signal": 0,
-        "low_relevance": 0, "expired": 0, "stale": 0, "undated": 0,
+        "low_relevance": 0, "expired": 0, "stale": 0,
+        "undated": 0, "page_verified_active": 0,
+        "page_verified_expired": 0, "page_verified_unknown": 0,
     }
 
     for lead in leads:
@@ -658,12 +667,62 @@ def _filter_serp_leads(leads: list, query: str) -> list:
             continue
 
         if deadline_status == 'missing':
-            counts["undated"] += 1
-            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
+            # Gate 8: Queue for page-fetch verification instead of letting it through
+            needs_page_verify.append(lead)
         else:
             lead._effective_score = lead.relevance_score
+            valid.append(lead)
 
-        valid.append(lead)
+    # ------------------------------------------------------------------
+    # Gate 8: Page-fetch deadline verification for undated leads
+    # Fetch each tender page to find the REAL deadline or detect closure.
+    # ------------------------------------------------------------------
+    if needs_page_verify:
+        print(f"    [Gate 8] Verifying {len(needs_page_verify)} undated leads by fetching actual pages...")
+
+    for lead in needs_page_verify:
+        url = getattr(lead, 'source_url', '') or ''
+        if not url:
+            counts["undated"] += 1
+            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
+            valid.append(lead)
+            continue
+
+        try:
+            vr = verify_deadline(url, timeout=12.0, use_llm=True)
+            vr_status = vr.get("status", "unknown")
+            vr_deadline = vr.get("deadline", "")
+            vr_source = vr.get("source", "none")
+
+            if vr_status in ("expired", "closed"):
+                # Page confirms it's expired or closed — BLOCK IT
+                counts["page_verified_expired"] += 1
+                print(f"      BLOCKED (page={vr_status}): {lead.title[:60]}... "
+                      f"[deadline={vr_deadline}, source={vr_source}]")
+                continue
+
+            if vr_status == "active" and vr_deadline:
+                # Page found a valid, active deadline — KEEP IT with full score
+                lead.submission_deadline = vr_deadline
+                lead._effective_score = lead.relevance_score
+                counts["page_verified_active"] += 1
+                print(f"      VERIFIED (active): {lead.title[:60]}... "
+                      f"[deadline={vr_deadline}, source={vr_source}]")
+                valid.append(lead)
+                continue
+
+            # Page fetch didn't find any deadline info — keep with penalty
+            counts["page_verified_unknown"] += 1
+            counts["undated"] += 1
+            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
+            valid.append(lead)
+
+        except Exception as exc:
+            # Page fetch failed — keep with penalty (graceful degradation)
+            counts["undated"] += 1
+            lead._effective_score = lead.relevance_score * NO_DEADLINE_SORT_PENALTY
+            valid.append(lead)
+            print(f"      WARN: page verify failed for {url[:60]}: {exc}")
 
     valid.sort(key=lambda l: getattr(l, '_effective_score', l.relevance_score), reverse=True)
 
@@ -672,6 +731,10 @@ def _filter_serp_leads(leads: list, query: str) -> list:
           f"no-kw={counts['no_strong_kw']} | empty={counts['empty_page']} | "
           f"not-tender={counts['no_tender_signal']} | low-rel={counts['low_relevance']} | "
           f"expired={counts['expired']} | stale={counts['stale']} | undated={counts['undated']}")
+    if any(counts[k] for k in ("page_verified_active", "page_verified_expired", "page_verified_unknown")):
+        print(f"    page-verify: active={counts['page_verified_active']} | "
+              f"expired={counts['page_verified_expired']} | "
+              f"unknown={counts['page_verified_unknown']}")
 
     return valid
 

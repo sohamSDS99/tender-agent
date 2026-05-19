@@ -34,10 +34,11 @@ logger = structlog.get_logger(__name__)
 # Regex patterns to find deadline/due/closing dates in Google snippets
 # Date-capture fragment shared by all deadline patterns
 _DATE_CAPTURE = (
-    r'(\d{1,2}[\s/\-]\w{3,9}[\s/\-]\d{4}'     # 15 April 2026 / 15-Mar-2026
-    r'|\w{3,9}\s+\d{1,2},?\s+\d{4}'             # April 15, 2026
-    r'|\d{4}[\-/]\d{2}[\-/]\d{2}'                # 2026-04-15
-    r'|\d{1,2}[\-/]\d{1,2}[\-/]\d{4}'            # 04/15/2026
+    r'(\d{1,2}[\s/\-\.]\w{3,9}[\s/\-\.]\d{4}'  # 15 April 2026 / 15-Mar-2026 / 13.Mar.2026
+    r'|\w{3,9}\s+\d{1,2},?\s+\d{4}'              # April 15, 2026
+    r'|\d{4}[\-/]\d{2}[\-/]\d{2}'                 # 2026-04-15
+    r'|\d{1,2}[\-/]\d{1,2}[\-/]\d{4}'             # 04/15/2026
+    r'|\d{1,2}\.\d{1,2}\.\d{4}'                   # 30.06.2026 (European dot format)
     r')'
 )
 
@@ -47,7 +48,8 @@ _DEADLINE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(
         r'(?:deadline|due\s*date|closing\s*date|closes|close\s*date|'
         r'submissions?\s*(?:due|deadline)|response\s*(?:due|deadline)|'
-        r'proposals?\s*due|bids?\s*due|offers?\s*due|submit\s*by)'
+        r'proposals?\s*due|bids?\s*due|offers?\s*due|tenders?\s*due|'
+        r'submit\s*(?:by|before|no\s*later\s*than))'
         r'\s*(?:on\s*)?[:\-–—]?\s*'
         + _DATE_CAPTURE,
         re.IGNORECASE,
@@ -57,6 +59,38 @@ _DEADLINE_PATTERNS: list[re.Pattern[str]] = [
         r'(?:open\s+until|valid\s+(?:until|through|till)|'
         r'expir(?:es?|ation|y)\s*(?:date)?)\s*'
         r'[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # Spanish: "Fecha de cierre: ..." / "Fecha limite: ..."
+    re.compile(
+        r'(?:fecha\s*de\s*(?:cierre|vencimiento|entrega)|'
+        r'fecha\s*l[ií]mite)\s*[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # French: "Date limite: ..." / "Date de cloture: ..."
+    re.compile(
+        r'(?:date\s*limite|date\s*de\s*cl[oô]ture)\s*'
+        r'(?:de\s*(?:soumission|depot|remise)\s*)?[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # German: "Frist: ..." / "Abgabefrist: ..." / "Schlusstermin: ..."
+    re.compile(
+        r'(?:(?:abgabe|angebots|einreichungs)?frist|schlusstermin)\s*[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # Italian: "Scadenza: ..." / "Termine: ..."
+    re.compile(
+        r'(?:scadenza|termine\s*(?:di\s*presentazione)?)\s*[:\-–—]?\s*'
+        + _DATE_CAPTURE,
+        re.IGNORECASE,
+    ),
+    # Portuguese: "Prazo: ..." / "Data limite: ..."
+    re.compile(
+        r'(?:prazo\s*(?:de\s*(?:entrega|submiss[aã]o))?|data\s*limite)\s*[:\-–—]?\s*'
         + _DATE_CAPTURE,
         re.IGNORECASE,
     ),

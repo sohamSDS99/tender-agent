@@ -380,7 +380,7 @@ class BrazilComprasSearcher:
             "Accept": "application/json",
         }
 
-        with httpx.Client(timeout=self.timeout, headers=headers) as client:
+        with httpx.Client(timeout=self.timeout, headers=headers, follow_redirects=True) as client:
             for page_num in range(1, max_pages + 1):
                 params: dict[str, str] = {
                     "pagina": str(page_num),

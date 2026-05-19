@@ -228,7 +228,7 @@ def _llm_extract_deadline(page_text: str, url: str) -> str | None:
     )
 
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             resp = client.post(
                 f"{base_url}/chat/completions",
                 headers={

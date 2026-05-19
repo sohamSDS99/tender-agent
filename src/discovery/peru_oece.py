@@ -252,7 +252,7 @@ class PeruOeceSearcher:
         Returns a list of release dicts or an empty list on failure.
         """
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
                 data = resp.json()

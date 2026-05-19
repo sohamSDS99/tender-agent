@@ -1088,51 +1088,92 @@ def run_tender_search(filters: dict) -> dict:
     def _mexico():
         return MexicoCdmxSearcher().search(user_query=search_query, max_results=10, days_back=60)
 
+    # Sources whose upstream JSON endpoints have been retired or changed
+    # without backward compat (verified May 2026). Skipping them avoids
+    # 20-30s of wasted retries per search. Re-enable any of these when
+    # someone finds the new endpoint URL and patches the corresponding
+    # discovery module.
+    #
+    # Investigation notes (so the next person doesn't re-do this work):
+    #   germany_bkms:     oeffentlichevergabe.de returns 404 on every /api
+    #                     path; the OCDS feed appears to have been removed.
+    #   brazil_compras:   dadosabertos.compras.gov.br returns 404 on every
+    #                     known path; portal migrated to gov.br/compras
+    #                     without a public OCDS feed yet.
+    #   mexico_cdmx:      tianguisdigital.cdmx.gob.mx returns 404 on every
+    #                     path; CDMX migrated to a new portal in 2025.
+    #   italy_anac:       dati.anticorruzione.it now serves Superset UI at
+    #                     /api/* paths instead of CKAN JSON.
+    #   sa_etender:       ocds-api.etenders.gov.za 404s; the OCDS feed
+    #                     appears to have moved or been disabled.
+    #   peru_oece:        contratacionesabiertas.oece.gob.pe returns 403
+    #                     on every path — likely IP-restricted now.
+    #   uganda_gpp:       gpp.ppda.go.ug returns HTML instead of JSON on
+    #                     every /api/* path; OCDS feed appears retired.
+    #   dominican_dgcp:   datosabiertos.dgcp.gob.do returns HTML page now.
+    KNOWN_BROKEN_APIS = {
+        "germany_bkms":   "404 on every known endpoint path",
+        "brazil_compras": "portal migrated; no public OCDS feed found",
+        "mexico_cdmx":    "tianguisdigital migrated; new feed unknown",
+        "italy_anac":     "dati.anticorruzione.it now serves Superset UI",
+        "sa_etender":     "OCDS endpoint 404",
+        "peru_oece":      "403 on every path (IP-restricted?)",
+        "uganda_gpp":     "OCDS endpoint returns HTML",
+        "dominican_dgcp": "datosabiertos.dgcp.gob.do returns HTML",
+    }
+
     api_jobs = []
+    def _add(name: str, fn):
+        if name in KNOWN_BROKEN_APIS:
+            print(f"  [{name}] skipped — {KNOWN_BROKEN_APIS[name]}")
+            return
+        api_jobs.append((name, fn))
+
     if region_match("europe", "uk", "global") and src_on("ted_europa"):
-        api_jobs.append(("ted_europa", _ted))
+        _add("ted_europa", _ted)
     if region_match("uk", "europe", "global") and src_on("uk_tenders"):
-        api_jobs.append(("uk_tenders", _uk))
+        _add("uk_tenders", _uk)
     if region_match("usa", "global") and src_on("sam_gov") and sam_api_key:
-        api_jobs.append(("sam_gov", _sam))
+        _add("sam_gov", _sam)
     elif region_match("usa", "global") and src_on("sam_gov") and not sam_api_key:
         print("  [SAM API] Skipped — SAM_GOV_API_KEY not set")
     if region_match("europe", "global") and src_on("boamp_france"):
-        api_jobs.append(("boamp_france", _boamp))
+        _add("boamp_france", _boamp)
     if region_match("global", "india", "australia") and src_on("world_bank"):
-        api_jobs.append(("world_bank", _wb))
+        _add("world_bank", _wb)
     if region_match("europe", "global") and src_on("prozorro"):
-        api_jobs.append(("prozorro", _prozorro))
+        _add("prozorro", _prozorro)
     if region_match("canada", "usa", "global") and src_on("canada_buys"):
-        api_jobs.append(("canada_buys", _canada))
+        _add("canada_buys", _canada)
     if region_match("australia", "global") and src_on("austender"):
-        api_jobs.append(("austender", _austender))
+        _add("austender", _austender)
     if region_match("africa", "global") and src_on("sa_etender"):
-        api_jobs.append(("sa_etender", _sa))
+        _add("sa_etender", _sa)
     if region_match("south_america", "global") and src_on("colombia_secop"):
-        api_jobs.append(("colombia_secop", _colombia))
+        _add("colombia_secop", _colombia)
     if region_match("south_america", "global") and src_on("brazil_compras"):
-        api_jobs.append(("brazil_compras", _brazil))
+        _add("brazil_compras", _brazil)
     if region_match("europe", "global") and src_on("germany_bkms"):
-        api_jobs.append(("germany_bkms", _germany))
+        _add("germany_bkms", _germany)
     if region_match("europe", "global") and src_on("italy_anac"):
-        api_jobs.append(("italy_anac", _italy))
+        _add("italy_anac", _italy)
     if region_match("south_america", "global") and src_on("dominican_dgcp"):
-        api_jobs.append(("dominican_dgcp", _dr))
+        _add("dominican_dgcp", _dr)
     if region_match("south_america", "global") and src_on("peru_oece"):
-        api_jobs.append(("peru_oece", _peru))
+        _add("peru_oece", _peru)
     if region_match("global", "india", "africa", "australia") and src_on("world_bank_v2"):
-        api_jobs.append(("world_bank_v2", _wb2))
+        _add("world_bank_v2", _wb2)
     if region_match("africa", "global") and src_on("nigeria_nocopo"):
-        api_jobs.append(("nigeria_nocopo", _nigeria))
+        _add("nigeria_nocopo", _nigeria)
     if region_match("africa", "global") and src_on("kenya_ppra"):
-        api_jobs.append(("kenya_ppra", _kenya))
+        _add("kenya_ppra", _kenya)
     if region_match("africa", "global") and src_on("uganda_gpp"):
-        api_jobs.append(("uganda_gpp", _uganda))
+        _add("uganda_gpp", _uganda)
     if region_match("south_america", "global") and src_on("mexico_cdmx"):
-        api_jobs.append(("mexico_cdmx", _mexico))
+        _add("mexico_cdmx", _mexico)
 
-    print(f"  Fanning out to {len(api_jobs)} APIs in parallel (max 10 workers)…")
+    print(f"  Fanning out to {len(api_jobs)} live APIs in parallel "
+          f"({len(KNOWN_BROKEN_APIS)} known-broken skipped)…")
     from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=10) as pool:
         future_to_name = {pool.submit(fn): name for name, fn in api_jobs}
@@ -1178,40 +1219,105 @@ def run_tender_search(filters: dict) -> dict:
     print(f"  API after deadline filter + dedup: {len(valid_leads)} verified leads")
 
     # ------------------------------------------------------------------
-    # Step 2a (NEW): re-score every lead against the USER's actual keywords.
-    # Each API module's internal scoring uses a hardcoded SDS/EHS keyword
-    # list, which produces sub-30% scores for legitimate matches when the
-    # user asks something like "hazardous materials management in Canada".
-    # We boost the score for leads whose title/description contain the
-    # user's prompt terms. The 30% absolute floor stays in place — but
-    # results that genuinely match the user's intent now stand a chance.
+    # Step 2a (NEW): re-score every lead against the USER's actual keywords,
+    # weighted by term specificity.
+    #
+    # The previous version treated every user term equally (+0.18 per match).
+    # That meant "Student Management System" got the same boost as "Hazardous
+    # Materials Management" — both have one term match ("management"). Bad.
+    #
+    # New scheme:
+    #   STRONG (domain-specific):   +0.22 per match
+    #   MEDIUM (regulation-ish):    +0.12 per match
+    #   WEAK   (generic admin):     +0.03 per match
+    #   default (unknown):          +0.10 per match
+    #   bigram phrase bonus:        +0.20 once if any two consecutive user
+    #                               terms appear together in the text
+    #
+    # Plus a guard: WEAK terms alone never push a lead over the 30% floor —
+    # if only weak terms match, the boost caps below what's needed to clear.
     # ------------------------------------------------------------------
+    STRONG_TERMS = {
+        "chemical", "chemicals", "hazardous", "hazmat", "toxic", "carcinogen",
+        "sds", "msds", "ghs", "ehs", "coshh", "reach", "clp",
+        "biohazard", "radioactive", "asbestos", "lead-paint", "pesticide",
+        "occupational",
+    }
+    MEDIUM_TERMS = {
+        "safety", "compliance", "environmental", "materials", "substances",
+        "substance", "regulation", "regulations", "classification",
+        "labelling", "labeling", "waste", "spill", "disposal", "hazard",
+        "hazards", "exposure", "remediation", "decontamination",
+    }
+    WEAK_TERMS = {
+        "management", "services", "service", "system", "systems", "software",
+        "platform", "contracts", "contract", "procurement", "tender",
+        "tenders", "rfp", "training", "consulting", "support", "supply",
+        "supplies", "agreement", "project", "program", "programme",
+    }
+    STOP_TERMS = {
+        "with", "from", "into", "that", "this", "these", "those",
+        "about", "what", "when", "where", "which", "while", "since",
+        "global", "local", "regional", "national", "international",
+        "year", "month", "week", "day",
+    }
+
     _user_terms = [
-        t.lower().strip(".,;:!?")
+        t.lower().strip(".,;:!?()[]")
         for t in (search_query or "").split()
-        if len(t) >= 4 and t.lower() not in {
-            "with", "from", "into", "that", "this", "these", "those",
-            "about", "what", "when", "where", "which", "while", "since",
-            "global", "local", "regional", "national",
-        }
+        if len(t) >= 3 and t.lower().strip(".,;:!?()[]") not in STOP_TERMS
     ]
+    _user_terms = [t for t in _user_terms if t]  # drop empties after strip
+
+    def _term_weight(term: str) -> float:
+        if term in STRONG_TERMS:
+            return 0.22
+        if term in MEDIUM_TERMS:
+            return 0.12
+        if term in WEAK_TERMS:
+            return 0.03
+        # Unknown words default to medium — assumed user-specific intent
+        # (acronyms, product names, place names like "canada", "germany").
+        return 0.10
+
     if _user_terms:
+        rescored = 0
         for lead in valid_leads:
             text = (
                 (getattr(lead, "title", "") or "") + " " +
                 (getattr(lead, "description", "") or "")
             ).lower()
-            matches = sum(1 for t in _user_terms if t in text)
-            if matches > 0:
-                # +0.18 per matching term, capped at +0.55 — enough to lift
-                # genuine matches over the 30% floor without flooding noise.
-                boost = min(0.55, matches * 0.18)
+
+            # Per-term contributions
+            boost = 0.0
+            matched_terms: list[str] = []
+            for t in _user_terms:
+                if t in text:
+                    boost += _term_weight(t)
+                    matched_terms.append(t)
+
+            # Bigram phrase bonus: any pair of consecutive user terms together
+            # in the text indicates a much stronger match than disjoint terms.
+            if len(_user_terms) >= 2:
+                for i in range(len(_user_terms) - 1):
+                    phrase = f"{_user_terms[i]} {_user_terms[i + 1]}"
+                    if phrase in text:
+                        boost += 0.20
+                        break  # one bonus is enough — don't stack
+
+            if boost > 0:
+                boost = min(0.60, boost)
                 current = float(getattr(lead, "relevance_score", 0) or 0)
                 new_score = min(1.0, current + boost)
                 lead.relevance_score = new_score
                 if hasattr(lead, "_effective_score"):
                     lead._effective_score = new_score
-        print(f"  [User-keyword rescore] Boosted leads matching: {_user_terms}")
+                rescored += 1
+
+        print(f"  [User-keyword rescore] Boosted {rescored}/{len(valid_leads)} "
+              f"leads | weighted terms: strong={sorted(set(_user_terms) & STRONG_TERMS)} "
+              f"medium={sorted(set(_user_terms) & MEDIUM_TERMS)} "
+              f"weak={sorted(set(_user_terms) & WEAK_TERMS)}")
 
     # ------------------------------------------------------------------
     # Step 2b: Relevance floor — user's pick OR 30% absolute, whichever larger.
@@ -1245,18 +1351,25 @@ def run_tender_search(filters: dict) -> dict:
             print(f"  [SERP] Got {len(serp_leads)} raw leads — running strict pipeline...")
             serp_valid = _filter_serp_leads(serp_leads, search_query)
             print(f"  [SERP] {len(serp_valid)} passed (all have verified deadlines)")
-            # Apply the same user-keyword rescore to SERP results so a generic
-            # contract that matches the user's prompt isn't filtered out by
-            # the hardcoded relevance scoring.
+            # Apply the same weighted rescore to SERP results.
             if _user_terms:
                 for lead in serp_valid:
                     text = (
                         (getattr(lead, "title", "") or "") + " " +
                         (getattr(lead, "description", "") or "")
                     ).lower()
-                    matches = sum(1 for t in _user_terms if t in text)
-                    if matches > 0:
-                        boost = min(0.55, matches * 0.18)
+                    boost = 0.0
+                    for t in _user_terms:
+                        if t in text:
+                            boost += _term_weight(t)
+                    if len(_user_terms) >= 2:
+                        for i in range(len(_user_terms) - 1):
+                            phrase = f"{_user_terms[i]} {_user_terms[i + 1]}"
+                            if phrase in text:
+                                boost += 0.20
+                                break
+                    if boost > 0:
+                        boost = min(0.60, boost)
                         current = float(getattr(lead, "relevance_score", 0) or 0)
                         new_score = min(1.0, current + boost)
                         lead.relevance_score = new_score

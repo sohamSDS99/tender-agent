@@ -315,7 +315,7 @@ class ColombiaSecopSearcher:
         if self.app_token:
             headers["X-App-Token"] = self.app_token
 
-        with httpx.Client(timeout=self.timeout, headers=headers) as client:
+        with httpx.Client(timeout=self.timeout, headers=headers, follow_redirects=True) as client:
             for page in range(pages):
                 offset = page * limit
 

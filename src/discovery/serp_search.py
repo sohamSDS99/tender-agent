@@ -726,7 +726,7 @@ class SerpTenderSearcher:
         date_label = "past_6mo" if use_date_filter else "none"
         logger.info("serp_query", query=query[:80], date_filter=date_label)
 
-        client = httpx.Client(proxy=self.proxy_url, verify=False, timeout=30.0)
+        client = httpx.Client(proxy=self.proxy_url, verify=False, timeout=30.0, follow_redirects=True)
         try:
             response = client.get(search_url)
             response.raise_for_status()

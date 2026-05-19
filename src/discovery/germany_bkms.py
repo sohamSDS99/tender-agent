@@ -265,7 +265,7 @@ class GermanyBkmsSearcher:
             List of release dicts if HTTP 200 and parseable, else None.
         """
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                 resp = client.get(url, params=params)
 
             if resp.status_code != 200:

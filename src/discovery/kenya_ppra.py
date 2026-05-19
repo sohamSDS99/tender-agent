@@ -144,7 +144,15 @@ class KenyaPpraSearcher:
         return []
 
     def _try_endpoint(self, endpoint: str, since: str) -> list[dict]:
-        """Try a single endpoint."""
+        """Try a single endpoint.
+
+        The Kenya PPRA portal (tenders.go.ke) has been serving an expired
+        SSL certificate as of mid-2026. The cert is on their server, not
+        ours — we can't fix it, but we can fall back to a TLS-relaxed
+        retry for that one host so we still get data when the regulator's
+        cert problem is upstream. Anything else SSL-related still fails
+        loudly.
+        """
         params: dict[str, Any] = {
             "releaseDate[gte]": since,
             "limit": 100,
@@ -152,10 +160,39 @@ class KenyaPpraSearcher:
         }
 
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                 resp = client.get(endpoint, params=params)
                 resp.raise_for_status()
                 data = resp.json()
+        except httpx.ConnectError as exc:
+            msg = str(exc)
+            if "certificate" in msg.lower() and "tenders.go.ke" in endpoint:
+                # One retry with verify disabled — public data, expired cert
+                # on their side. Logged so this isn't invisible to ops.
+                logger.warning(
+                    "kenya_ssl_fallback",
+                    endpoint=endpoint,
+                    msg="Retrying with verify=False — Kenya PPRA cert is expired",
+                )
+                try:
+                    with httpx.Client(
+                        timeout=self.timeout,
+                        follow_redirects=True,
+                        verify=False,
+                    ) as client:
+                        resp = client.get(endpoint, params=params)
+                        resp.raise_for_status()
+                        data = resp.json()
+                except Exception as inner_exc:
+                    logger.debug(
+                        "kenya_endpoint_error",
+                        endpoint=endpoint,
+                        error=str(inner_exc),
+                    )
+                    return []
+            else:
+                logger.debug("kenya_endpoint_error", endpoint=endpoint, error=msg)
+                return []
         except Exception as exc:
             logger.debug("kenya_endpoint_error", endpoint=endpoint, error=str(exc))
             return []

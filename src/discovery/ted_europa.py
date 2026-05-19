@@ -201,7 +201,7 @@ class TedEuropaSearcher:
             "Accept": "application/json",
         }
 
-        client = httpx.Client(timeout=self.timeout)
+        client = httpx.Client(timeout=self.timeout, follow_redirects=True)
         try:
             response = client.post(url, json=body, headers=headers)
             response.raise_for_status()

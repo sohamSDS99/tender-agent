@@ -328,8 +328,14 @@ class SamGovScraper:
         posted_to = datetime.now(timezone.utc).strftime("%m/%d/%Y")
 
         leads: list[TenderLead] = []
+        rate_limited = False  # 429 is a DAILY quota; if we hit it once,
+                              # every subsequent NAICS code will 429 too.
+                              # Skip them instead of hammering the API.
 
         for naics in naics_codes:
+            if rate_limited:
+                break
+
             params = {
                 "api_key": self._api_key,
                 "postedFrom": posted_from,
@@ -344,7 +350,15 @@ class SamGovScraper:
                     SAM_API_BASE,
                     params=params,
                     timeout=30.0,
+                    follow_redirects=True,
                 )
+                if response.status_code == 429:
+                    rate_limited = True
+                    logger.warning(
+                        "sam_gov_rate_limited",
+                        msg="SAM.gov daily quota exhausted; skipping remaining NAICS codes",
+                    )
+                    break
                 response.raise_for_status()
                 data = response.json()
 
@@ -365,12 +379,20 @@ class SamGovScraper:
                         raw_data=opp,
                     ))
 
+            except httpx.HTTPStatusError as exc:
+                # Some 4xx codes are also terminal (e.g. 401 invalid key); skip
+                # the rest if the API key isn't accepted.
+                if exc.response.status_code in (401, 403):
+                    rate_limited = True
+                    logger.error(
+                        "sam_gov_auth_failed",
+                        status_code=exc.response.status_code,
+                        msg="SAM.gov rejected API key; skipping remaining NAICS codes",
+                    )
+                    break
+                logger.error("sam_gov_api_error", naics=naics, error=str(exc))
             except Exception as exc:
-                logger.error(
-                    "sam_gov_api_error",
-                    naics=naics,
-                    error=str(exc),
-                )
+                logger.error("sam_gov_api_error", naics=naics, error=str(exc))
 
         return leads
 

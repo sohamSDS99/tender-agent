@@ -283,7 +283,7 @@ class ProzorroSearcher:
         if offset:
             params["offset"] = offset
 
-        with httpx.Client(timeout=self.timeout) as client:
+        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
             resp = client.get(PROZORRO_API_URL, params=params)
             resp.raise_for_status()
             data = resp.json()

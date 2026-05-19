@@ -273,7 +273,7 @@ class ItalyAnacSearcher:
             List of release dicts if HTTP 200 and parseable, else None.
         """
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                 resp = client.get(url, params=params)
 
             if resp.status_code != 200:
@@ -383,7 +383,7 @@ class ItalyAnacSearcher:
 
                     if resource_format == "JSON" and resource_url:
                         try:
-                            with httpx.Client(timeout=self.timeout) as client:
+                            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                                 res_resp = client.get(resource_url)
 
                             if res_resp.status_code == 200:

@@ -250,7 +250,7 @@ class CanadaBuysSearcher:
         """
         try:
             # Step 1: Get dataset metadata (lists all resources / files)
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                 meta_resp = client.get(CKAN_API_URL)
                 meta_resp.raise_for_status()
                 meta_data = meta_resp.json()
@@ -321,7 +321,7 @@ class CanadaBuysSearcher:
 
             # Step 3: Download and parse the resource.
             # Use a longer timeout for potentially large files.
-            with httpx.Client(timeout=max(self.timeout, 60.0)) as client:
+            with httpx.Client(timeout=max(self.timeout, 60.0, follow_redirects=True)) as client:
                 data_resp = client.get(resource_url)
                 data_resp.raise_for_status()
 

@@ -1178,6 +1178,42 @@ def run_tender_search(filters: dict) -> dict:
     print(f"  API after deadline filter + dedup: {len(valid_leads)} verified leads")
 
     # ------------------------------------------------------------------
+    # Step 2a (NEW): re-score every lead against the USER's actual keywords.
+    # Each API module's internal scoring uses a hardcoded SDS/EHS keyword
+    # list, which produces sub-30% scores for legitimate matches when the
+    # user asks something like "hazardous materials management in Canada".
+    # We boost the score for leads whose title/description contain the
+    # user's prompt terms. The 30% absolute floor stays in place — but
+    # results that genuinely match the user's intent now stand a chance.
+    # ------------------------------------------------------------------
+    _user_terms = [
+        t.lower().strip(".,;:!?")
+        for t in (search_query or "").split()
+        if len(t) >= 4 and t.lower() not in {
+            "with", "from", "into", "that", "this", "these", "those",
+            "about", "what", "when", "where", "which", "while", "since",
+            "global", "local", "regional", "national",
+        }
+    ]
+    if _user_terms:
+        for lead in valid_leads:
+            text = (
+                (getattr(lead, "title", "") or "") + " " +
+                (getattr(lead, "description", "") or "")
+            ).lower()
+            matches = sum(1 for t in _user_terms if t in text)
+            if matches > 0:
+                # +0.18 per matching term, capped at +0.55 — enough to lift
+                # genuine matches over the 30% floor without flooding noise.
+                boost = min(0.55, matches * 0.18)
+                current = float(getattr(lead, "relevance_score", 0) or 0)
+                new_score = min(1.0, current + boost)
+                lead.relevance_score = new_score
+                if hasattr(lead, "_effective_score"):
+                    lead._effective_score = new_score
+        print(f"  [User-keyword rescore] Boosted leads matching: {_user_terms}")
+
+    # ------------------------------------------------------------------
     # Step 2b: Relevance floor — user's pick OR 30% absolute, whichever larger.
     # ------------------------------------------------------------------
     before_relevance = len(valid_leads)
@@ -1209,6 +1245,23 @@ def run_tender_search(filters: dict) -> dict:
             print(f"  [SERP] Got {len(serp_leads)} raw leads — running strict pipeline...")
             serp_valid = _filter_serp_leads(serp_leads, search_query)
             print(f"  [SERP] {len(serp_valid)} passed (all have verified deadlines)")
+            # Apply the same user-keyword rescore to SERP results so a generic
+            # contract that matches the user's prompt isn't filtered out by
+            # the hardcoded relevance scoring.
+            if _user_terms:
+                for lead in serp_valid:
+                    text = (
+                        (getattr(lead, "title", "") or "") + " " +
+                        (getattr(lead, "description", "") or "")
+                    ).lower()
+                    matches = sum(1 for t in _user_terms if t in text)
+                    if matches > 0:
+                        boost = min(0.55, matches * 0.18)
+                        current = float(getattr(lead, "relevance_score", 0) or 0)
+                        new_score = min(1.0, current + boost)
+                        lead.relevance_score = new_score
+                        if hasattr(lead, "_effective_score"):
+                            lead._effective_score = new_score
             for lead in serp_valid:
                 if getattr(lead, "relevance_score", 0) < relevance_floor:
                     blocked_relevance += 1

@@ -41,7 +41,14 @@ logger = structlog.get_logger(__name__)
 # API endpoint
 # ---------------------------------------------------------------------------
 
-SECOP_API_URL = "https://www.datos.gov.co/resource/jbjy-vk9h.json"
+# SECOP II — Procesos de Contratación. The previous module pointed at
+# the CONTRACTS dataset (jbjy-vk9h) which records already-awarded
+# contracts and therefore has no submission deadline column — every
+# query against it 400'd with "Unknown column: fecha_de_cierre". The
+# correct dataset for active tender opportunities is p6dx-8zbt.
+# Verified against https://www.datos.gov.co/api/views/p6dx-8zbt.json
+# in May 2026.
+SECOP_API_URL = "https://www.datos.gov.co/resource/p6dx-8zbt.json"
 
 # Public web view for a single procurement notice
 SECOP_NOTICE_URL_TEMPLATE = (
@@ -95,8 +102,12 @@ _AGENCY_FIELDS: list[str] = [
     "nombre_de_la_entidad",
 ]
 
-# Deadline fields (closing date)
+# Deadline fields (closing date). On the SECOP II Procesos dataset the
+# canonical submission deadline is `fecha_de_recepcion_de` (Fecha de
+# Recepción de Respuestas).  Older field names kept as fallbacks in
+# case Socrata republishes the dataset under a different shape.
 _DEADLINE_FIELDS: list[str] = [
+    "fecha_de_recepcion_de",
     "fecha_de_cierre",
     "fecha_cierre",
     "fecha_de_cierre_del_proceso",
@@ -104,9 +115,9 @@ _DEADLINE_FIELDS: list[str] = [
 
 # Posted date fields
 _POSTED_FIELDS: list[str] = [
+    "fecha_de_publicacion_del",
     "fecha_de_publicacion",
     "fecha_publicacion",
-    "fecha_de_publicacion_del",
 ]
 
 # Value fields
@@ -319,11 +330,15 @@ class ColombiaSecopSearcher:
             for page in range(pages):
                 offset = page * limit
 
+                # SECOP II Procesos: filter by `fecha_de_recepcion_de`
+                # (active submission deadline) — used to be
+                # `fecha_de_cierre` on the contracts dataset which we
+                # no longer point at.
                 params: dict[str, str] = {
                     "$limit": str(limit),
                     "$offset": str(offset),
-                    "$order": "fecha_de_cierre DESC",
-                    "$where": f"fecha_de_cierre > '{cutoff_date}'",
+                    "$order": "fecha_de_recepcion_de DESC",
+                    "$where": f"fecha_de_recepcion_de > '{cutoff_date}'",
                 }
 
                 try:

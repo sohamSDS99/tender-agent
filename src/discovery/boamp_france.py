@@ -159,9 +159,19 @@ class BoampSearcher:
         """
         logger.info("boamp_search_start", days_back=days_back, max_results=max_results)
 
-        # Build the where clause: active tenders published within date range
+        # Build the where clause: active tenders published within date range.
+        # BOAMP renamed/replaced its `nature` taxonomy in 2025; the old
+        # AVIS_DE_MARCHE value no longer exists. Live values today are:
+        # APPEL_OFFRE (call for tenders), PRE-INFORMATION, QUALIFICATION,
+        # INTENTION_CONCLURE — we accept all four since the SDS scorer
+        # filters anyway. We deliberately skip ATTRIBUTION (awarded),
+        # ANNULATION (cancelled), MODIFICATION (amendment), and the
+        # other administrative natures.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        where = f'nature="AVIS_DE_MARCHE" AND dateparution>="{cutoff}"'
+        where = (
+            'nature IN ("APPEL_OFFRE","PRE-INFORMATION","QUALIFICATION","INTENTION_CONCLURE") '
+            f'AND dateparution>="{cutoff}"'
+        )
 
         # Fetch up to 2 pages (200 results max)
         all_records: list[dict] = []
@@ -243,8 +253,16 @@ class BoampSearcher:
             "order_by": "dateparution desc",
             "limit": limit,
             "offset": offset,
+            # Field rename in BOAMP schema (verified May 2026):
+            #   "descripteurs"  →  "descripteur_libelle"  (human-readable
+            #                       descriptor list; "descripteur_code"
+            #                       is the machine-readable counterpart)
+            #   "organisme"     →  "nomacheteur"
+            # The old names now produce ODSQLError: Unknown field. Both
+            # new fields exist on every record; we use the readable one
+            # so keyword matching still scores correctly.
             "select": (
-                "objet,descripteurs,organisme,dateparution,"
+                "objet,descripteur_libelle,nomacheteur,dateparution,"
                 "datelimitereponse,datefindiffusion,idweb,nature"
             ),
         }
@@ -292,11 +310,22 @@ class BoampSearcher:
         if not title:
             return None
 
-        descripteurs = fields.get("descripteurs", "") or ""
+        # BOAMP renamed `descripteurs` -> `descripteur_libelle` and
+        # `organisme` -> `nomacheteur` in 2025-2026.  Read the new names
+        # but fall back to the old ones in case the API ever back-ports.
+        descripteurs = (
+            fields.get("descripteur_libelle")
+            or fields.get("descripteurs")
+            or ""
+        )
         if isinstance(descripteurs, list):
             descripteurs = " ".join(str(d) for d in descripteurs)
 
-        agency = fields.get("organisme", "") or ""
+        agency = (
+            fields.get("nomacheteur")
+            or fields.get("organisme")
+            or ""
+        )
         if not agency:
             agency = "Organisme public français"
 

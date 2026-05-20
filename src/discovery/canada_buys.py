@@ -56,6 +56,19 @@ CKAN_API_URL = (
     "?id=6abd20d4-7a1c-4b38-baa2-9525d0bb2fd2"
 )
 
+# canadabuys.canada.ca returns HTTP 403 to clients without a browser-like
+# User-Agent (Azure CDN bot protection).  The CKAN API itself does not
+# require this but it does no harm to send the same headers everywhere.
+_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/csv,application/csv,application/xml,*/*",
+    "Accept-Language": "en-CA,en;q=0.9",
+}
+
 # ---------------------------------------------------------------------------
 # Keyword filtering — same domain as SAM.gov / TED / UK, plus Canada-specific
 # ---------------------------------------------------------------------------
@@ -250,7 +263,7 @@ class CanadaBuysSearcher:
         """
         try:
             # Step 1: Get dataset metadata (lists all resources / files)
-            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=_BROWSER_HEADERS) as client:
                 meta_resp = client.get(CKAN_API_URL)
                 meta_resp.raise_for_status()
                 meta_data = meta_resp.json()
@@ -321,7 +334,7 @@ class CanadaBuysSearcher:
 
             # Step 3: Download and parse the resource.
             # Use a longer timeout for potentially large files.
-            with httpx.Client(timeout=max(self.timeout, 60.0, follow_redirects=True)) as client:
+            with httpx.Client(timeout=max(self.timeout, 60.0), follow_redirects=True, headers=_BROWSER_HEADERS) as client:
                 data_resp = client.get(resource_url)
                 data_resp.raise_for_status()
 

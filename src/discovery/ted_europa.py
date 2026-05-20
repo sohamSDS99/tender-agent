@@ -25,7 +25,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -37,46 +37,54 @@ logger = structlog.get_logger(__name__)
 # TED API config
 # ---------------------------------------------------------------------------
 
-# Primary (new) and fallback (old) API endpoints
+# TED v3 search API. v2 was retired in 2025; v3 (eForms) is the only live
+# endpoint as of May 2026.  No fallback — there's nothing valid to fall
+# back TO; if v3 is down the searcher just returns [] and the parallel
+# fan-out keeps moving.
 TED_API_URL = "https://api.ted.europa.eu/v3/notices/search"
-TED_API_URL_FALLBACK = "https://ted.europa.eu/api/v3.0/notices/search"
 
 # CPV codes relevant to SDS/EHS/chemical safety software
 # See: https://simap.ted.europa.eu/cpv
 RELEVANT_CPV_CODES: list[str] = [
-    "905*",     # Environmental services (broad)
-    "7131720*", # Health and safety services
-    "4800000*", # Software package and information systems
-    "7200000*", # IT services: consulting, development, support
-    "3342120*", # Safety equipment
-    "3314100*", # Industrial chemicals
-    "9052400*", # Hazardous waste management
+    "905",      # Environmental services (broad)
+    "7131720",  # Health and safety services
+    "4800000",  # Software package and information systems
+    "7200000",  # IT services: consulting, development, support
+    "3342120",  # Safety equipment
+    "3314100",  # Industrial chemicals
+    "9052400",  # Hazardous waste management
 ]
 
 # Full-text search terms for SDS/EHS domain
 SDS_SEARCH_TERMS: list[str] = [
-    '"safety data sheet"',
-    '"chemical safety"',
-    '"SDS management"',
-    '"hazardous material"',
-    '"EHS"',
-    '"GHS"',
-    '"chemical compliance"',
-    '"MSDS"',
-    '"hazard communication"',
+    "safety data sheet",
+    "chemical safety",
+    "SDS management",
+    "hazardous material",
+    "EHS",
+    "GHS",
+    "chemical compliance",
+    "MSDS",
+    "hazard communication",
 ]
 
-# Fields to request from the TED API
+# Fields to request from the TED v3 API.  Each one was live-probed against
+# api.ted.europa.eu/v3/notices/search and returns HTTP 200; sending any
+# OTHER eForm field code (e.g. "buyer-name", "deadline-receipt-tenders",
+# "place-of-performance") now returns 400 and kills the whole request.
+#
+# The v3 API exposes ~1830 eForm field codes; we only need the ones that
+# carry user-visible content for the AMS card view and relevance scoring.
 REQUESTED_FIELDS: list[str] = [
     "publication-number",
     "notice-title",
-    "buyer-name",
-    "notice-type",
+    "description-glo",
+    "deadline-receipt-tender-date-lot",
+    "organisation-name-buyer",
+    "classification-cpv",
+    "tender-value",
+    "tender-value-cur",
     "publication-date",
-    "deadline-receipt-tenders",
-    "notice-url",
-    "place-of-performance",
-    "short-description",
 ]
 
 
@@ -121,7 +129,7 @@ class TedEuropaSearcher:
         Returns:
             List of TedTenderLead objects with real, structured data.
         """
-        # Build the expert query for TED's search syntax
+        # Build the expert query for TED's v3 search syntax
         query = self._build_query(user_query)
 
         logger.info("ted_search_start", query=query[:120], max_results=max_results)
@@ -131,23 +139,16 @@ class TedEuropaSearcher:
             "fields": REQUESTED_FIELDS,
             "limit": min(max_results, 100),
             "scope": "ACTIVE",
+            # onlyLatestVersions=true dedupes corrigenda — without it a
+            # single tender that's been amended N times surfaces N rows.
+            "onlyLatestVersions": True,
             "paginationMode": "PAGE_NUMBER",
             "page": 1,
         }
 
-        # Try primary endpoint, fall back to legacy
-        results = None
-        for api_url in [TED_API_URL, TED_API_URL_FALLBACK]:
-            try:
-                results = self._call_api(api_url, request_body)
-                if results is not None:
-                    break
-            except Exception as exc:
-                logger.warning("ted_api_attempt_failed", url=api_url, error=str(exc))
-                continue
-
+        results = self._call_api(TED_API_URL, request_body)
         if results is None:
-            logger.error("ted_search_failed", msg="All API endpoints failed")
+            logger.error("ted_search_failed", msg="v3 search API returned no result")
             return []
 
         leads = self._parse_results(results)
@@ -161,19 +162,19 @@ class TedEuropaSearcher:
         return leads
 
     def _build_query(self, user_query: str) -> str:
-        """Build a TED expert search query from the user's text.
+        """Build a TED v3 expert search query.
 
-        TED expert query syntax:
-          - FT=[term] for full-text search
-          - TD=[CN] for contract notices
-          - Multiple conditions joined with AND/OR
+        v3 syntax is BARE values joined with the operator, e.g.
+            FT="safety data sheet" OR FT="chemical safety"
+        The old v2 bracket form (FT=[a OR b]) returns HTTP 400 on v3.
+        Field codes (FT, PD, CY, TD, etc.) come from the eForms SDK.
         """
-        # Start with SDS/EHS full-text search terms
-        ft_terms = " OR ".join(SDS_SEARCH_TERMS)
+        # SDS/EHS full-text branch — joined by OR-of-FT clauses
+        sds_branch = " OR ".join(f'FT="{t}"' for t in SDS_SEARCH_TERMS)
 
-        # If user provided extra terms, add them
+        # User branch — narrow the SDS set by intersecting user keywords
+        user_branch = ""
         if user_query:
-            # Extract meaningful words (skip common ones)
             skip_words = {
                 "find", "search", "tender", "tenders", "rfp", "procurement",
                 "for", "in", "the", "a", "an", "and", "or", "europe",
@@ -184,11 +185,18 @@ class TedEuropaSearcher:
                 if w not in skip_words and len(w) > 2
             ]
             if user_words:
-                user_ft = " OR ".join(f'"{w}"' for w in user_words[:5])
-                ft_terms = f"({ft_terms}) AND ({user_ft})"
+                user_branch = " OR ".join(f'FT="{w}"' for w in user_words[:5])
 
-        # Only active contract notices (CN) and prior information notices (PIN)
-        query = f"FT=[{ft_terms}] AND TD=[CN OR PIN]"
+        if user_branch:
+            query = f"({sds_branch}) AND ({user_branch})"
+        else:
+            query = sds_branch
+
+        # Recency guard: TED scope=ACTIVE already filters out expired
+        # notices, but we add a publication-date lower bound to keep the
+        # candidate set small and fast.  Default: last 120 days.
+        pd_floor = (datetime.now(timezone.utc) - timedelta(days=120)).strftime("%Y%m%d")
+        query = f"({query}) AND PD>={pd_floor}"
 
         return query
 
@@ -240,40 +248,56 @@ class TedEuropaSearcher:
         return leads
 
     def _parse_notice(self, notice: dict) -> TedTenderLead | None:
-        """Parse a single TED notice into a TedTenderLead."""
-        # TED returns fields as key-value pairs — extract what we need
-        # The structure varies by API version; handle both formats
+        """Parse a single TED v3 notice into a TedTenderLead.
 
+        v3 returns each requested field as either a scalar, a list, or a
+        multilingual dict like ``{"ENG": "...", "FRA": "..."}``.  The
+        helper ``_get_field`` collapses all three shapes.  The public
+        notice URL lives in ``links.html.ENG`` — that's the only reliable
+        web URL TED returns.
+        """
         pub_number = self._get_field(notice, "publication-number", "")
         title = self._get_field(notice, "notice-title", "")
-        buyer = self._get_field(notice, "buyer-name", "Unknown")
+        buyer = self._get_field(notice, "organisation-name-buyer", "Unknown")
         pub_date = self._get_field(notice, "publication-date", "")
-        deadline = self._get_field(notice, "deadline-receipt-tenders", "")
-        description = self._get_field(notice, "short-description", "")
-        notice_url = self._get_field(notice, "notice-url", "")
+        deadline = self._get_field(notice, "deadline-receipt-tender-date-lot", "")
+        description = self._get_field(notice, "description-glo", "")
+        cpv_code = self._get_field(notice, "classification-cpv", "")
+
+        # links.html.ENG is the only reliable public URL TED v3 returns.
+        notice_url = ""
+        links = notice.get("links", {}) or {}
+        html_links = links.get("html", {}) or {}
+        if isinstance(html_links, dict):
+            notice_url = html_links.get("ENG") or html_links.get("ENG-GB") or ""
+            if not notice_url and html_links:
+                # fall back to whatever language came first
+                notice_url = next(iter(html_links.values()), "")
+        if not notice_url and pub_number:
+            notice_url = f"https://ted.europa.eu/en/notice/-/detail/{pub_number}"
 
         if not title and not pub_number:
             return None
 
-        # Build source URL
-        if not notice_url and pub_number:
-            notice_url = f"https://ted.europa.eu/en/notice/-/detail/{pub_number}"
-
-        # Parse deadline to ISO format
         deadline_iso = self._parse_ted_date(deadline)
         posted_iso = self._parse_ted_date(pub_date)
+
+        keywords = ["ted.europa.eu", "EU procurement"]
+        if cpv_code and any(cpv_code.startswith(p) for p in RELEVANT_CPV_CODES):
+            keywords.append(f"cpv:{cpv_code}")
 
         return TedTenderLead(
             lead_id=pub_number or f"TED-{uuid.uuid4().hex[:8].upper()}",
             title=title or f"TED Notice {pub_number}",
             description=description[:500] if description else "",
-            agency=buyer,
+            agency=buyer or "Unknown",
             source_url=notice_url,
             submission_deadline=deadline_iso,
             posted_date=posted_iso,
-            relevance_keywords=["ted.europa.eu", "EU procurement"],
+            relevance_keywords=keywords,
             raw_data={
-                **notice,
+                "publication-number": pub_number,
+                "cpv": cpv_code,
                 "has_strong_match": True,    # TED results are pre-qualified
                 "has_tender_signal": True,   # It's literally a tender portal
                 "is_empty_page": False,
@@ -282,48 +306,62 @@ class TedEuropaSearcher:
 
     @staticmethod
     def _get_field(notice: dict, field_name: str, default: str = "") -> str:
-        """Extract a field value from a TED notice.
+        """Extract a field value from a TED v3 notice.
 
-        TED API returns fields in various formats depending on version:
-          - Direct key-value: notice["notice-title"]
-          - Nested in "fields": notice["fields"]["notice-title"]
-          - Array of {name, value}: [{"name": "notice-title", "value": "..."}]
-          - Multilingual: {"eng": "English title", "fra": "French title"}
+        TED v3 returns each requested field as one of:
+          - scalar string: ``"...
+          - list of scalars: ``["...
+          - list of multilingual dicts: ``[{"ENG": "...
+          - bare multilingual dict: ``{"ENG": "...
+          - list of lists (when the eForm has multiple lots): ``[["...
         """
-        # Try direct access
-        val = notice.get(field_name)
-        if val:
-            if isinstance(val, dict):
-                # Multilingual — prefer English
-                return val.get("eng", val.get("en", next(iter(val.values()), default)))
-            if isinstance(val, list):
-                return val[0] if val else default
-            return str(val)
+        def _unwrap(v):  # recursively collapse list/dict shells
+            if v is None:
+                return default
+            if isinstance(v, str):
+                return v
+            if isinstance(v, (int, float)):
+                return str(v)
+            if isinstance(v, list):
+                if not v:
+                    return default
+                # Pick first non-empty entry, then unwrap
+                for item in v:
+                    out = _unwrap(item)
+                    if out:
+                        return out
+                return default
+            if isinstance(v, dict):
+                # Multilingual — prefer English. eForm code is "ENG" / "ENG-GB";
+                # legacy two-letter "eng"/"en" kept for backward compat.
+                for k in ("ENG", "ENG-GB", "eng", "en"):
+                    if k in v and v[k]:
+                        return _unwrap(v[k])
+                if v:
+                    return _unwrap(next(iter(v.values())))
+                return default
+            return str(v)
 
-        # Try nested in "fields"
+        # Try direct access first (v3 shape)
+        if field_name in notice:
+            out = _unwrap(notice.get(field_name))
+            if out:
+                return out
+
+        # Legacy v2 shape, kept for resilience if TED ever back-ports v2
+        # responses to the v3 endpoint.  None of these branches fire on
+        # current production responses but they're cheap.
         fields = notice.get("fields", {})
-        if isinstance(fields, dict):
-            val = fields.get(field_name)
-            if val:
-                if isinstance(val, dict):
-                    return val.get("eng", val.get("en", next(iter(val.values()), default)))
-                if isinstance(val, list):
-                    return val[0] if val else default
-                return str(val)
-
-        # Try array-of-dicts format
+        if isinstance(fields, dict) and field_name in fields:
+            out = _unwrap(fields[field_name])
+            if out:
+                return out
         if isinstance(fields, list):
             for f in fields:
                 if isinstance(f, dict) and f.get("name") == field_name:
-                    return str(f.get("value", default))
-
-        # Try content blob (some API versions embed all data here)
-        content = notice.get("content", notice.get("CONTENT", ""))
-        if content and isinstance(content, str) and field_name == "short-description":
-            # Extract first meaningful text chunk
-            text = re.sub(r'<[^>]+>', ' ', content)
-            text = re.sub(r'\s+', ' ', text).strip()
-            return text[:500] if text else default
+                    out = _unwrap(f.get("value"))
+                    if out:
+                        return out
 
         return default
 

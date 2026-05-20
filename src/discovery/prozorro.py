@@ -179,10 +179,12 @@ class ProzorroSearcher:
         logger.info("prozorro_search_start", days_back=days_back, max_results=max_results)
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-        all_tenders: list[dict] = []
+        stubs: list[dict] = []
         offset: str | None = None
 
-        # Paginate up to 3 pages
+        # Paginate up to 3 pages of newest stubs. Each page is ~100
+        # rows. 300 newest tenders is plenty — relevance scoring caps
+        # results anyway and we don't want to hydrate the world.
         for page in range(3):
             try:
                 page_tenders, next_offset = self._fetch_tenders_page(offset)
@@ -193,14 +195,36 @@ class ProzorroSearcher:
             if not page_tenders:
                 break
 
-            all_tenders.extend(page_tenders)
+            stubs.extend(page_tenders)
             logger.debug("prozorro_page_fetched", page=page, count=len(page_tenders))
 
             if not next_offset:
                 break
             offset = next_offset
 
-        logger.info("prozorro_raw_results", total=len(all_tenders))
+        # Hydrate stubs → full tender records in parallel. Each detail
+        # fetch is ~300ms; with a 12-worker pool the whole batch
+        # completes in ~3-5s well inside the bridge's 90s ceiling.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        all_tenders: list[dict] = []
+        # Cap hydration to keep wall-time bounded even when the feed
+        # is dense.
+        hydrate_budget = min(len(stubs), 100)
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            futures = [pool.submit(self._hydrate_tender, s) for s in stubs[:hydrate_budget]]
+            for f in as_completed(futures, timeout=self.timeout + 10):
+                try:
+                    record = f.result()
+                except Exception:
+                    record = None
+                if record:
+                    all_tenders.append(record)
+
+        logger.info(
+            "prozorro_raw_results",
+            stubs=len(stubs),
+            hydrated=len(all_tenders),
+        )
 
         # Parse, filter status, score, and filter relevance
         leads: list[ProzorroTenderLead] = []
@@ -273,13 +297,23 @@ class ProzorroSearcher:
     ) -> tuple[list[dict], str | None]:
         """Fetch a single page of tenders from the Prozorro API.
 
+        The Prozorro listing endpoint is a "changes feed" — by default
+        it starts at the OLDEST record (2015), which is why the
+        previous module silently returned 0 scored leads. We pass
+        ``descending=1`` to flip to newest-first.
+
+        The listing only returns minimal stubs (id, dateModified,
+        tenderID, status). Titles and descriptions live behind the
+        per-tender detail endpoint at /tenders/{id} — see
+        ``_hydrate_tenders`` below.
+
         Args:
             offset: Pagination offset token from a previous response.
 
         Returns:
-            Tuple of (list of tender dicts, next offset or None).
+            Tuple of (list of tender stub dicts, next offset or None).
         """
-        params: dict[str, str] = {}
+        params: dict[str, str] = {"descending": "1"}
         if offset:
             params["offset"] = offset
 
@@ -294,6 +328,37 @@ class ProzorroSearcher:
             next_offset = data.get("offset")
 
         return tenders, next_offset
+
+    def _hydrate_tender(self, stub: dict) -> dict | None:
+        """Fetch full tender record by ID from the Prozorro detail endpoint.
+
+        The listing endpoint only returns ``id`` and ``dateModified`` —
+        title/description/items/CPV all live in the per-tender detail
+        record at /tenders/{id}. Returns the inner ``data`` dict or
+        None on any error.
+        """
+        tender_id = stub.get("id", "")
+        if not tender_id:
+            return None
+        try:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+                resp = client.get(f"{PROZORRO_API_URL}/{tender_id}")
+                resp.raise_for_status()
+                payload = resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                # Preserve the stub's dateModified — sometimes the detail
+                # endpoint returns a slightly different value
+                if "dateModified" in stub and "dateModified" not in data:
+                    data["dateModified"] = stub["dateModified"]
+                return data
+        except Exception as exc:
+            logger.debug(
+                "prozorro_hydrate_error",
+                tender_id=tender_id[:20],
+                error=str(exc),
+            )
+        return None
 
     def _parse_tender(self, tender: dict) -> ProzorroTenderLead | None:
         """Parse a single Prozorro tender dict into a ProzorroTenderLead."""

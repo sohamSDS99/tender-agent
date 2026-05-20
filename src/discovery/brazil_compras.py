@@ -54,13 +54,17 @@ COMPRAS_BASE_URL = "https://pncp.gov.br"
 #   tamanhoPagina: min 10, max 50
 _PNCP_ENDPOINT = "/api/consulta/v1/contratacoes/publicacao"
 
-# PNCP responsiveness is intermittent — modalidade 4 (Concorrência) is
-# the only one that responds within 12s reliably (verified May 2026).
-# Pregão (6) and Dispensa (8) time out >45s. Diálogo competitivo (13)
-# is hit-and-miss. Stick to 4 and accept the occasional Brazilian
-# coverage gap rather than dragging the whole search wall time up.
+# PNCP per-modalidade latency, re-probed May 20 2026 with
+# tamanhoPagina=10. Modalidades 3, 4, 8 reliably return inside 4s;
+# modalidades 1, 5, 6 timed out at 12s on the same machine despite
+# the smaller page size (the earlier curl probes that suggested they
+# were fast were a one-off — PNCP's load-balancer routes different
+# modalidades to different shards and only some are warm). Sticking
+# to the proven trio keeps the parallel fan-out's worst case bounded.
 _PNCP_MODALIDADES: list[int] = [
-    4,   # Concorrência eletrônica — most reliable + most relevant
+    3,   # Concurso
+    4,   # Concorrência eletrônica — most SDS-relevant
+    8,   # Dispensa de licitação
 ]
 
 # Public web view for a single procurement notice. The PNCP URL pattern
@@ -380,10 +384,14 @@ class BrazilComprasSearcher:
     def _fetch_tenders(
         self,
         days_back: int = 60,
-        page_size: int = 50,
+        # Smaller pages return MUCH faster from PNCP — at p=10 the
+        # working modalidades return in 2-3s; at p=50 modalidade 4
+        # times out at 30s+. The relevance scorer doesn't care about
+        # record count so trimming page_size is a free latency win.
+        page_size: int = 10,
         # One page per modalidade keeps total wall time bounded even if
-        # PNCP is in a slow mode. The first 50 records per modalidade
-        # is more than enough — relevance scoring caps results anyway.
+        # PNCP is in a slow mode. With 6 modalidades * 10 records that
+        # is 60 candidates per search — plenty for the scorer.
         max_pages: int = 1,
     ) -> list[dict[str, Any]]:
         """Fetch tender records from PNCP (Portal Nacional de Contratações Públicas).

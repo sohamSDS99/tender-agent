@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+import shutil
 import tempfile
 import threading
 import traceback
@@ -68,6 +69,10 @@ from src.discovery.mexico_cdmx import MexicoCdmxSearcher
 from src.forms.form_parser import FormParser
 from src.forms.form_filler import FormFiller, FillResult
 from src.forms.form_writer import FormWriter
+from src.forms.form_example_ingester import (
+    process_pending_form_examples,
+    search_similar_examples,
+)
 
 # Slack notifications
 from slack_notifier import (
@@ -870,6 +875,15 @@ _PORTAL_TO_REGION: dict[str, str] = {
 # Absolute floor — wins even when the user-supplied minRelevance is lower.
 ABSOLUTE_RELEVANCE_FLOOR = 0.30
 
+# Floor used ONLY during the auto-broaden retry pass. The strict
+# 30% floor exists to keep generic public-sector noise out of the first
+# attempt; once we've already failed to find enough and have explicitly
+# opted into "show me anything close", a more permissive 20% rescues
+# borderline tenders (e.g. an OSHA contract that scored 0.27 after the
+# rescore) without admitting garbage. Expired tenders stay blocked
+# unconditionally by the deadline gates — this only relaxes RELEVANCE.
+BROADEN_RELEVANCE_FLOOR = 0.20
+
 
 def _parse_iso_date(value):
     """Parse a string like '2026-05-19' or '2026-05-19T00:00:00Z' to a date.
@@ -1026,7 +1040,12 @@ def run_tender_search(filters: dict) -> dict:
 
     include_serp = bool(filters.get("includeSerpFallback", True))
     user_min_relevance = float(filters.get("minRelevance") or ABSOLUTE_RELEVANCE_FLOOR)
-    relevance_floor = max(user_min_relevance, ABSOLUTE_RELEVANCE_FLOOR)
+    # Pass 1 enforces the strict 30% absolute floor; pass 2 (auto-broaden,
+    # marked via filters["_broaden_pass"]) drops to 20% so borderline matches
+    # — tenders that scored 0.20-0.29 after the rescore — get a fair chance.
+    is_broaden_pass = bool(filters.get("_broaden_pass"))
+    abs_floor = BROADEN_RELEVANCE_FLOOR if is_broaden_pass else ABSOLUTE_RELEVANCE_FLOOR
+    relevance_floor = max(user_min_relevance, abs_floor)
 
     print(f"\n{'='*60}")
     print(f"  Tender search: '{search_query[:80]}'")
@@ -1110,10 +1129,21 @@ def run_tender_search(filters: dict) -> dict:
     #   peru_oece:      contratacionesabiertas.oece.gob.pe returns 403 on
     #                   every path (looks IP-restricted). osce.gob.pe
     #                   returns HTML login pages.
-    #   uganda_gpp:     gpp.ppda.go.ug returns HTML on every /api/* path;
-    #                   the OCDS feed appears to have been retired.
+    #   uganda_gpp:     gpp.ppda.go.ug now serves an Angular SPA frontend
+    #                   on every /api/* path — no JSON OCDS feed.
+    #                   Retired in late 2025.
     #   dominican_dgcp: api.dgcp.gob.do is documented but unreachable
     #                   (connection refused / DNS unstable as of probe).
+    #   kenya_ppra:     tenders.go.ke OCDS endpoints all return HTML
+    #                   error pages now (Expecting value: line 1 column 1)
+    #                   on all 4 candidate paths. SSL cert also expired.
+    #                   Added to broken list May 20, 2026 — module's
+    #                   verify=False fallback no longer helps because
+    #                   the actual responses are HTML, not JSON.
+    #   nigeria_nocopo: nocopo.bpp.gov.ng/api/ocds/releases now 404.
+    #                   /OpenData.aspx redirects to /Open-Data which is
+    #                   a DNN CMS HTML page, not JSON. SSL cert also
+    #                   expired. Added May 20, 2026.
     #
     # REVIVED (May 2026) and removed from this list:
     #   brazil_compras: migrated from dadosabertos.compras.gov.br to the
@@ -1128,6 +1158,8 @@ def run_tender_search(filters: dict) -> dict:
         "peru_oece":      "403 on every path (IP-restricted?)",
         "uganda_gpp":     "OCDS endpoint returns HTML",
         "dominican_dgcp": "api.dgcp.gob.do unreachable",
+        "kenya_ppra":     "tenders.go.ke OCDS endpoints return HTML (broken May 2026)",
+        "nigeria_nocopo": "nocopo.bpp.gov.ng /api/ocds/releases 404; only DNN HTML left",
     }
 
     api_jobs = []
@@ -1250,6 +1282,17 @@ def run_tender_search(filters: dict) -> dict:
         "sds", "msds", "ghs", "ehs", "coshh", "reach", "clp",
         "biohazard", "radioactive", "asbestos", "lead-paint", "pesticide",
         "occupational",
+        # Regulator / standard acronyms — same domain weight as the
+        # direct hazard nouns. Tested against the chip examples; without
+        # these, prompts like "OSHA compliance SDS database" mis-classify
+        # OSHA as a default-weight unknown word, and otherwise-relevant
+        # tenders fall just below the 30% floor.
+        "osha", "niosh", "epa", "dot", "fda", "phmsa",  # US
+        "echa", "reach-clp", "seveso",                   # EU
+        "hse", "coshh-uk",                                # UK
+        "whmis", "ccohs",                                 # Canada
+        "safework",                                       # Australia
+        "ilo",                                            # International
     }
     MEDIUM_TERMS = {
         "safety", "compliance", "environmental", "materials", "substances",
@@ -1591,12 +1634,43 @@ def handle_fill_form_task(client: NexusClient, task: dict) -> None:
                                 notes=f"Auto-revert: {msg}")
             return
 
-        filler = FormFiller(llm_call_fn=call_llm, confidence_threshold=0.7)
+        # Hook up the example-search callable so the filler can ground
+        # each field's answer in past Q&A pairs. We close over the
+        # agent name + voyage key + AMS URL here so the filler stays
+        # ignorant of HTTP.
+        voyage_key = os.getenv("VOYAGE_API_KEY", "")
+
+        def _example_search(question: str) -> list[dict]:
+            if not voyage_key:
+                return []
+            return search_similar_examples(
+                ams_url=NEXUS_URL,
+                agent_name=_AGENT_NAME,
+                question=question,
+                voyage_api_key=voyage_key,
+                limit=3,
+                min_similarity=0.55,
+                auth_headers=_AUTH_HEADERS,
+                timeout=10.0,
+            )
+
+        filler = FormFiller(
+            llm_call_fn=call_llm,
+            confidence_threshold=0.7,
+            example_search_fn=_example_search if voyage_key else None,
+            examples_per_field=3,
+        )
         fill_result = filler.fill(parse_result, company_context)
-        print(f"  [fill_form] Filled {fill_result.filled_count}/{fill_result.total_fields}, "
-              f"{fill_result.needs_clarification_count} low-confidence flagged")
+        print(
+            f"  [fill_form] Filled {fill_result.filled_count}/{fill_result.total_fields} "
+            f"(high={fill_result.high_confidence_count} medium={fill_result.medium_confidence_count} "
+            f"low={fill_result.low_confidence_count}), grounded in "
+            f"{len(fill_result.examples_used)} past example(s)"
+        )
         _audit("form_filled",
-               f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields, "
+               f"Filled {fill_result.filled_count}/{fill_result.total_fields} fields "
+               f"({fill_result.high_confidence_count}/{fill_result.medium_confidence_count}/"
+               f"{fill_result.low_confidence_count} high/med/low), "
                f"{fill_result.needs_clarification_count} need review",
                node_name="fill_form",
                cost_usd=fill_result.llm_cost_usd,
@@ -1604,6 +1678,9 @@ def handle_fill_form_task(client: NexusClient, task: dict) -> None:
                    "filled_count": fill_result.filled_count,
                    "total_fields": fill_result.total_fields,
                    "low_confidence_count": fill_result.needs_clarification_count,
+                   "high_confidence_count": fill_result.high_confidence_count,
+                   "medium_confidence_count": fill_result.medium_confidence_count,
+                   "examples_used": fill_result.examples_used,
                    "filled_field_names": [f.name for f in fill_result.filled_fields],
                })
 
@@ -1657,6 +1734,385 @@ def handle_fill_form_task(client: NexusClient, task: dict) -> None:
         print(f"  [fill_form] Metric flush failed: {exc}")
 
 
+def handle_form_revision_task(
+    client: NexusClient, task: dict, *, use_llm: bool
+) -> None:
+    """Process a fill_form_regenerate or fill_form_revise task.
+
+    Both task types feed off the same submission and produce a new
+    revision; the difference is whether we re-run the LLM:
+
+      use_llm=False  → "Save my edits + regenerate":
+        Take the human's answers, merge with the existing filled
+        fields, run FormWriter to produce 4 new file formats. No
+        new LLM call. ~3-5s wall time.
+
+      use_llm=True   → "Send back to agent":
+        Take the human's answers as PRE-EXISTING context, re-run
+        FormFiller. Previously-blank fields can now fill if the LLM
+        infers them from the human's anchors. Then run FormWriter.
+        ~30-90s wall time.
+
+    On completion the bridge PATCHes /api/submissions/:id with the
+    new outputSummary, formats array, and pushes a revision entry.
+    """
+    start_time = time.perf_counter()
+    task_id = task.get("id")
+    metadata = task.get("metadata") or {}
+    submission_id = metadata.get("submissionId")
+    human_answers: dict[str, str] = dict(metadata.get("humanAnswers") or {})
+    target_rev = int(metadata.get("targetRevision") or 0)
+    operator_note = metadata.get("operatorNote") or ""
+
+    if not submission_id:
+        msg = "revision task missing metadata.submissionId"
+        print(f"  [revise] ERROR: {msg}")
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg, duration_ms=0)
+        return
+
+    print(
+        f"  [revise] submission={submission_id[:8]} action="
+        f"{'revise' if use_llm else 'regenerate'} "
+        f"target_rev={target_rev} edits={len(human_answers)}"
+    )
+
+    # 1. Fetch submission detail from AMS — we need the original
+    #    document reference + the existing filled fields + the
+    #    previously-unfilled list.
+    try:
+        url = _ams_url(f"/api/submissions/{submission_id}?full=1")
+        with httpx.Client(timeout=15.0) as http_client:
+            resp = http_client.get(url, headers=_AUTH_HEADERS)
+            resp.raise_for_status()
+            sub = resp.json()
+    except Exception as exc:
+        msg = f"could not fetch submission {submission_id}: {exc}"
+        print(f"  [revise] ERROR: {msg}")
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg, duration_ms=0)
+        return
+
+    if sub.get("status") != "pending":
+        msg = f"submission is {sub.get('status')} — refusing to edit"
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg, duration_ms=0)
+        return
+
+    sub_meta = sub.get("metadata") or {}
+    sub_out = sub.get("outputSummary") or {}
+    doc = sub.get("document") or {}
+
+    # Find the ORIGINAL (blank) form to re-parse the field list.
+    # When the operator first uploaded the form via the Pursuits side
+    # panel, we recorded its MinIO key in submission.metadata.originalFormKey.
+    # If that's missing (legacy submissions), fall back to the current
+    # submission document — it's the FILLED form but at least has
+    # the same fields.
+    original_minio_key = (
+        sub_meta.get("originalFormKey")
+        or doc.get("minioKey")
+        or ""
+    )
+    original_filename = doc.get("filename") or "form.pdf"
+
+    if not original_minio_key:
+        msg = "submission has no original form reference; cannot regenerate"
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg, duration_ms=0)
+        return
+
+    tmp_dir = tempfile.mkdtemp(prefix="form_revise_")
+    local_form_path = os.path.join(tmp_dir, original_filename)
+
+    try:
+        # 2. Download the form
+        client.download_file(original_minio_key, local_form_path)
+
+        # 3. Parse the form to get the canonical field list
+        parsed = FormParser().parse(local_form_path)
+        if not parsed.fields:
+            msg = f"re-parsing {original_filename} yielded no fields"
+            complete_agent_task(client, task_id, status="failed",
+                                result_summary=msg, duration_ms=0)
+            return
+
+        # 4. Build the FillResult either by pure-merge (regenerate)
+        #    or by re-running FormFiller with human anchors (revise).
+        existing_fields = sub_out.get("fields") if isinstance(sub_out.get("fields"), list) else []
+        existing_unfilled = sub_out.get("unfilled") if isinstance(sub_out.get("unfilled"), list) else []
+
+        if use_llm:
+            # Re-run FormFiller — pass human_answers as user_answers
+            # so the LLM treats them as ground truth and only re-fills
+            # the still-blank ones.
+            voyage_key = os.getenv("VOYAGE_API_KEY", "")
+
+            def _example_search(question: str) -> list[dict]:
+                if not voyage_key:
+                    return []
+                return search_similar_examples(
+                    ams_url=NEXUS_URL,
+                    agent_name=_AGENT_NAME,
+                    question=question,
+                    voyage_api_key=voyage_key,
+                    limit=3,
+                    min_similarity=0.55,
+                    auth_headers=_AUTH_HEADERS,
+                    timeout=10.0,
+                )
+
+            filler = FormFiller(
+                llm_call_fn=call_llm,
+                confidence_threshold=0.7,
+                example_search_fn=_example_search if voyage_key else None,
+                examples_per_field=3,
+            )
+            company_context = fetch_agent_context() or ""
+            fill_result = filler.fill(parsed, company_context, user_answers=human_answers)
+            print(
+                f"  [revise] LLM re-ran: filled={fill_result.filled_count}/"
+                f"{fill_result.total_fields} "
+                f"(human-anchored={sum(1 for ff in fill_result.filled_fields if ff.source == 'user_input')})"
+            )
+        else:
+            # Pure merge — no LLM. Build FilledField objects by
+            # combining the existing fields with the human's edits.
+            # Human edits ALWAYS win; for fields not in the human
+            # edits, keep the existing value/confidence/source.
+            from src.forms.form_filler import FilledField, _tier_for
+            merged: dict[str, FilledField] = {}
+
+            # Start from the existing fields (from rev N)
+            for ef in existing_fields:
+                name = str(ef.get("name") or "")
+                if not name:
+                    continue
+                merged[name] = FilledField(
+                    name=name,
+                    value=str(ef.get("value") or ""),
+                    confidence=float(ef.get("confidence") or 0),
+                    source=str(ef.get("source") or "agent_inference"),
+                    reasoning=str(ef.get("reasoning") or ""),
+                    confidence_tier=str(ef.get("confidenceTier") or "low"),
+                    example_doc_ids=list(ef.get("exampleDocIds") or []),
+                )
+
+            # Apply human edits — they override OR fill previously-blank
+            for name, value in human_answers.items():
+                if not value or not value.strip():
+                    continue
+                merged[name] = FilledField(
+                    name=name,
+                    value=value.strip(),
+                    confidence=1.0,
+                    source="user_input",
+                    reasoning="Provided by operator",
+                    confidence_tier=_tier_for(1.0, "user_input"),
+                    example_doc_ids=[],
+                )
+
+            # Re-derive "unfilled" — fields from the original parsed
+            # form that aren't in merged (or have empty values).
+            still_blank = [
+                f for f in parsed.fields
+                if f.name not in merged or not (merged[f.name].value or "").strip()
+            ]
+
+            high = sum(1 for ff in merged.values() if ff.confidence_tier == "high")
+            medium = sum(1 for ff in merged.values() if ff.confidence_tier == "medium")
+            low = sum(1 for ff in merged.values() if ff.confidence_tier == "low")
+
+            class _StubFillResult:
+                pass
+            fill_result = _StubFillResult()
+            fill_result.filled_fields = [
+                ff for ff in merged.values() if (ff.value or "").strip()
+            ]
+            fill_result.questions = []  # we built `still_blank` separately below
+            fill_result.total_fields = len(parsed.fields)
+            fill_result.filled_count = len(fill_result.filled_fields)
+            fill_result.needs_clarification_count = len(still_blank)
+            fill_result.llm_cost_usd = 0.0
+            fill_result.llm_tokens = 0
+            fill_result.high_confidence_count = high
+            fill_result.medium_confidence_count = medium
+            fill_result.low_confidence_count = low
+            fill_result.examples_used = []
+
+        # 5. Write the four file formats with the merged answers.
+        writer = FormWriter()
+        stem = Path(original_filename).stem
+        ext = Path(original_filename).suffix
+        revised_filename = f"{stem}_FILLED_rev{target_rev}{ext}"
+        revised_path = os.path.join(tmp_dir, revised_filename)
+        writer.write(local_form_path, fill_result.filled_fields, revised_path)
+
+        canonical_paths: dict[str, str] = {}
+        try:
+            canonical_paths = writer.write_canonical_set(
+                fill_result.filled_fields,
+                output_dir=tmp_dir,
+                base_name=f"{stem}_FILLED_rev{target_rev}",
+                title=f"{sub.get('title') or 'Filled Form'} — Revision {target_rev}",
+            )
+        except Exception as exc:
+            print(f"  [revise] Canonical export skipped: {exc}")
+
+        # 6. Upload everything to MinIO so the AMS Approvals card
+        #    can offer it for download.
+        primary_up = client.upload_file(revised_path, filename=revised_filename)
+        primary_meta = {
+            "minioKey": primary_up.get("minioKey") or "",
+            "filename": primary_up.get("filename") or revised_filename,
+            "mimeType": primary_up.get("mimeType") or "",
+            "sizeBytes": int(primary_up.get("sizeBytes") or os.path.getsize(revised_path)),
+        }
+
+        new_formats: list[dict] = []
+        for fmt, path in canonical_paths.items():
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                up = client.upload_file(path, filename=os.path.basename(path))
+                new_formats.append({
+                    "format": fmt,
+                    "filename": up.get("filename") or os.path.basename(path),
+                    "mimeType": up.get("mimeType") or "",
+                    "sizeBytes": int(up.get("sizeBytes") or os.path.getsize(path)),
+                    "minioKey": up.get("minioKey") or "",
+                    "kind": "canonical",
+                })
+            except Exception as exc:
+                print(f"  [revise] Canonical {fmt} upload failed: {exc}")
+
+        # 7. Build the per-field payload + PATCH the submission.
+        fields_payload = [
+            {
+                "name": ff.name[:200],
+                "value": (ff.value or "")[:600],
+                "confidence": round(ff.confidence, 3),
+                "confidenceTier": ff.confidence_tier,
+                "source": ff.source,
+                "exampleDocIds": ff.example_doc_ids,
+                "reasoning": (ff.reasoning or "")[:280],
+                "filledBy": (
+                    "human_rev" + str(target_rev)
+                    if ff.source == "user_input"
+                    else "agent_rev" + str(target_rev) if use_llm
+                    else "agent_rev" + str(int(sub_out.get("currentRevision") or 1))
+                ),
+            }
+            for ff in fill_result.filled_fields[:80]
+        ]
+
+        # Re-derive unfilled (for both branches)
+        if use_llm:
+            unfilled_payload = [
+                {
+                    "name": q.field_name[:200],
+                    "question": (q.question or "")[:400],
+                    "context": (q.context or "")[:300],
+                    "suggestions": list(q.suggestions or [])[:5],
+                    "fieldType": "text",
+                }
+                for q in (fill_result.questions or [])[:80]
+            ]
+        else:
+            unfilled_payload = [
+                {
+                    "name": f.name[:200],
+                    "question": f"What should I put for \"{f.name}\"?",
+                    "context": "Still blank after operator's edits — please provide.",
+                    "suggestions": [],
+                    "fieldType": getattr(f, "field_type", "text"),
+                }
+                for f in still_blank[:80]  # only valid in the no-LLM branch
+            ]
+
+        change_count = len(human_answers)
+        revision_summary = (
+            (f"Operator edits applied (no LLM): {change_count} field(s) overridden, "
+             f"{fill_result.filled_count}/{fill_result.total_fields} now filled")
+            if not use_llm
+            else (f"Re-ran agent with {change_count} operator anchor(s): "
+                  f"{fill_result.filled_count}/{fill_result.total_fields} fields filled "
+                  f"(LLM cost ${float(fill_result.llm_cost_usd or 0):.4f})")
+        )
+        if operator_note:
+            revision_summary += f" — note: {operator_note[:200]}"
+
+        patch_body = {
+            "outputSummary": {
+                "filled_count": fill_result.filled_count,
+                "total_fields": fill_result.total_fields,
+                "fields": fields_payload,
+                "unfilled": unfilled_payload,
+                "confidenceSummary": {
+                    "high": fill_result.high_confidence_count,
+                    "medium": fill_result.medium_confidence_count,
+                    "low": fill_result.low_confidence_count,
+                    "blank": len(unfilled_payload),
+                },
+                "examplesUsed": list(getattr(fill_result, "examples_used", []) or []),
+                "currentRevision": target_rev,
+            },
+            "newFormats": new_formats,
+            "newPrimaryDocument": {
+                "minioKey": primary_meta["minioKey"],
+                "filename": primary_meta["filename"],
+                "mimeType": primary_meta["mimeType"],
+                "sizeBytes": primary_meta["sizeBytes"],
+            },
+            "revision": {
+                "rev": target_rev,
+                "filledBy": "agent" if use_llm else "human",
+                "summary": revision_summary,
+                "changedFieldNames": list(human_answers.keys()),
+                "costUsd": float(getattr(fill_result, "llm_cost_usd", 0) or 0),
+            },
+        }
+
+        url = _ams_url(f"/api/submissions/{submission_id}")
+        with httpx.Client(timeout=20.0) as http_client:
+            resp = http_client.patch(url, json=patch_body, headers=_AUTH_HEADERS)
+            resp.raise_for_status()
+
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        print(f"  [revise] rev {target_rev} pushed in {duration_ms}ms")
+        complete_agent_task(client, task_id, status="completed",
+                            result_summary=revision_summary[:500],
+                            duration_ms=duration_ms)
+        _audit("task_completed",
+               f"Form revision r{target_rev}: {revision_summary[:200]}",
+               node_name="fill_form_revise",
+               cost_usd=float(getattr(fill_result, "llm_cost_usd", 0) or 0),
+               duration_ms=duration_ms,
+               output_payload={
+                   "submission_id": submission_id,
+                   "revision": target_rev,
+                   "filled_count": fill_result.filled_count,
+                   "total_fields": fill_result.total_fields,
+                   "use_llm": use_llm,
+               })
+
+    except Exception as exc:
+        traceback.print_exc()
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        msg = f"revision task failed: {exc}"
+        print(f"  [revise] {msg}")
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg[:500],
+                            duration_ms=duration_ms)
+        _audit("task_failed", msg, status="failure", error_message=str(exc),
+               input_payload={"submission_id": submission_id, "use_llm": use_llm})
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _submit_filled_form(
     client: NexusClient,
     task_id: str,
@@ -1677,22 +2133,124 @@ def _submit_filled_form(
     ext = Path(original_filename).suffix
     output_filename = f"{stem}_FILLED{ext}"
     output_path = os.path.join(tmp_dir, output_filename)
+    # 1) Original-format fill — preserves the procurement template
+    #    (logos, sections, AcroForm fields). This is what the operator
+    #    submits to the procurement portal.
     writer.write(local_path, fill_result.filled_fields, output_path)
+
+    # 2) Canonical editable companions — clean Q&A tables in DOCX,
+    #    XLSX, and PDF. Generated once at fill time so the Approvals
+    #    UI can offer instant download in any format without an
+    #    extra LLM call.
+    canonical_paths: dict[str, str] = {}
+    try:
+        canonical_paths = writer.write_canonical_set(
+            fill_result.filled_fields,
+            output_dir=tmp_dir,
+            base_name=f"{stem}_FILLED",
+            title=f"{tender_title} — Filled",
+        )
+    except Exception as exc:
+        print(f"  [fill_form] Canonical export skipped: {exc}")
 
     filled_field_summary = {ff.name: ff.value for ff in fill_result.filled_fields[:30]}
     low_confidence_names = [
         ff.name for ff in fill_result.filled_fields if ff.confidence < 0.7
     ]
+
+    # Per-field provenance + confidence tier — drives the Approvals UI
+    # coloured-badge display. Keep field strings short so the metadata
+    # blob stays well under Postgres' jsonb practical limits.
+    #
+    # filledBy tags the provenance of the value:
+    #   "agent_rev1" — first agent pass (initial fill)
+    #   "agent_revN" — bridge re-ran after a "Send back to agent"
+    #   "human_revN" — operator edited / supplied a missing answer
+    # This drives the revision-history panel in the approvals UI.
+    fields_payload = [
+        {
+            "name": ff.name[:200],
+            "value": (ff.value or "")[:600],
+            "confidence": round(ff.confidence, 3),
+            "confidenceTier": ff.confidence_tier,
+            "source": ff.source,
+            "exampleDocIds": ff.example_doc_ids,
+            "reasoning": (ff.reasoning or "")[:280],
+            "filledBy": "agent_rev1",
+        }
+        for ff in fill_result.filled_fields[:80]
+    ]
+
+    # Unfilled fields — the ones the agent left BLANK because it wasn't
+    # confident enough. These are the rows the operator sees as red
+    # input boxes on the approvals card. The bridge already excludes
+    # them from filled_fields (see form_filler — anything below the
+    # 0.7 confidence threshold becomes a ClarificationQuestion); we
+    # surface them here with the question text + reasoning so the UI
+    # can render meaningful input prompts.
+    unfilled_payload = [
+        {
+            "name": q.field_name[:200],
+            "question": (q.question or "")[:400],
+            "context": (q.context or "")[:300],
+            "suggestions": list(q.suggestions or [])[:5],
+            "fieldType": getattr(
+                getattr(q, "original_field", None), "field_type", "text"
+            ) if hasattr(q, "original_field") else "text",
+        }
+        for q in (fill_result.questions or [])[:80]
+    ]
+
     output_summary = {
         "filled_count": fill_result.filled_count,
         "total_fields": fill_result.total_fields,
         "filled_fields": filled_field_summary,
         "low_confidence_field_names": low_confidence_names,
         "pursuit_id": pursuit_id,
+        # Per-field confidence + which past examples grounded the fill
+        "fields": fields_payload,
+        # NEW: blank fields the operator must fill (or re-task the agent on)
+        "unfilled": unfilled_payload,
+        "confidenceSummary": {
+            "high": fill_result.high_confidence_count,
+            "medium": fill_result.medium_confidence_count,
+            "low": fill_result.low_confidence_count,
+            "blank": len(unfilled_payload),
+        },
+        "examplesUsed": fill_result.examples_used,
+        # Revision counter — agent's first pass is always rev 1. The
+        # AMS will bump this when the operator hits "Save edits" or
+        # "Send back to agent".
+        "currentRevision": 1,
     }
 
+    # Upload canonical companion formats so they're available for download
+    # via the Approvals "Download as…" dropdown. Each upload returns a
+    # MinIO key the AMS `/api/files/[...key]` endpoint can stream from.
+    # The original-format file is uploaded by submit_for_approval below;
+    # only the alternates go through upload_file here.
+    alternate_formats: list[dict] = []
+    for fmt, path in canonical_paths.items():
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            up = client.upload_file(path, filename=os.path.basename(path))
+            alternate_formats.append({
+                "format": fmt,                       # "docx" | "xlsx" | "pdf"
+                "filename": up.get("filename") or os.path.basename(path),
+                "mimeType": up.get("mimeType") or "",
+                "sizeBytes": int(up.get("sizeBytes") or os.path.getsize(path)),
+                "minioKey": up.get("minioKey") or "",
+                "kind": "canonical",                  # vs "original"
+            })
+        except Exception as exc:
+            print(f"  [fill_form] Canonical {fmt} upload failed: {exc}")
+
     try:
-        print(f"  [fill_form] Submitting for approval: {output_filename}")
+        print(
+            f"  [fill_form] Submitting for approval: {output_filename} "
+            f"(+ {len(alternate_formats)} canonical companion(s))"
+        )
         result = client.submit_for_approval(
             thread_id=None,
             action_type="form_fill",
@@ -1717,6 +2275,41 @@ def _submit_filled_form(
                 "cost_usd": fill_result.llm_cost_usd,
                 "llm_model": LLM_MODEL,
                 "pursuit_id": pursuit_id,
+                # Original form (BLANK) reference — the bridge needs this
+                # on every regenerate/revise so it can re-parse the field
+                # list. The original file lives in MinIO under the same
+                # key the operator uploaded.
+                "originalFormKey": os.path.basename(local_path),
+                # The Approvals UI reads `formats` to render the
+                # "Download as…" dropdown.  The primary submission's
+                # documentId is the original format; alternates live
+                # here as MinIO refs only (no Document rows).
+                "formats": alternate_formats,
+                # Revision history — bridge writes rev 1 here, AMS
+                # appends rev 2, 3, … when the operator iterates.
+                # Each entry: { rev, filledBy, filledAt, summary,
+                # changedFieldNames }.
+                "revisions": [
+                    {
+                        "rev": 1,
+                        "filledBy": "agent",
+                        "filledAt": __import__("datetime").datetime.now(
+                            __import__("datetime").timezone.utc
+                        ).isoformat(),
+                        "summary": (
+                            f"Agent's initial fill: {fill_result.filled_count}/"
+                            f"{fill_result.total_fields} fields "
+                            f"(high={fill_result.high_confidence_count} "
+                            f"medium={fill_result.medium_confidence_count} "
+                            f"low={fill_result.low_confidence_count} "
+                            f"blank={len(unfilled_payload)})"
+                        ),
+                        "changedFieldNames": [
+                            ff.get("name", "") for ff in fields_payload
+                        ],
+                        "costUsd": float(fill_result.llm_cost_usd or 0),
+                    }
+                ],
             },
         )
         submission_id = result.get("submissionId", "?")
@@ -1997,9 +2590,14 @@ def _broaden_filters(filters: dict) -> dict:
     """Relax constraints when the strict pass returned too few results.
 
     Drops value range, extends deadline window by 60 days, opens posted
-    window to "all", and re-enables every source. Keeps the 30% absolute
-    relevance floor in place (non-negotiable per spec). Returns a fresh
-    dict so the caller can compare before/after if needed.
+    window to "all", and re-enables every source. ALSO lowers the
+    relevance floor from 30% to 20% via the _broaden_pass flag — the
+    strict 30% is there to keep generic public-sector noise out of the
+    first attempt, but a relevance-anchored auto-broaden ("find me
+    anything close") deserves to surface borderline tenders that
+    scored 0.20-0.29. Expired tenders stay blocked unconditionally by
+    the deadline gates. Returns a fresh dict so the caller can
+    compare before/after if needed.
     """
     relaxed = dict(filters or {})
     relaxed["minValueUsd"] = None
@@ -2007,6 +2605,14 @@ def _broaden_filters(filters: dict) -> dict:
     relaxed["postedWithinDays"] = "all"
     relaxed["sources"] = []  # all 20 sources
     relaxed["includeSerpFallback"] = True
+    # Two flags the broaden pass uses:
+    #   _broaden_pass — tells run_tender_search to use the 20% floor.
+    #   minRelevance  — keeps the user's UI value in sync.
+    relaxed["_broaden_pass"] = True
+    relaxed["minRelevance"] = min(
+        float(relaxed.get("minRelevance") or BROADEN_RELEVANCE_FLOOR),
+        BROADEN_RELEVANCE_FLOOR,
+    )
     # Extend the deadline window forward by 60 days so we catch tenders that
     # close later than the user's original window. We never push the window
     # earlier — expired tenders stay blocked by the deadline gates.
@@ -2034,10 +2640,51 @@ def _generate_brief(filters: dict, tenders: list[dict], stats: dict) -> str:
     """
     n = len(tenders)
     if n == 0:
+        blocked_expired = int(stats.get("blockedExpired") or 0)
+        blocked_relevance = int(stats.get("blockedRelevance") or 0)
+        total_candidates = blocked_expired + blocked_relevance
+        broadened = bool(stats.get("broadened"))
+
+        # Tailor the empty-state explanation to what we ACTUALLY saw.
+        # Generic "try broader keywords" is unhelpful when the agent
+        # found 72 candidates but blocked all of them.
+        if total_candidates == 0:
+            return (
+                "No tenders matched these filters at any source. The agent "
+                "ran the parallel fan-out and SERP fallback — neither found "
+                "any candidates. Try a broader region (e.g. 'Global') or "
+                "drop one constraint from your prompt."
+            )
+
+        if blocked_expired > 0 and blocked_relevance == 0:
+            return (
+                f"The agent found {blocked_expired} matching tenders but all "
+                f"of them have already passed their submission deadline. Tip: "
+                f"this often happens when the prompt references a fixed past "
+                f"date range ('published last 6 months'). Re-run without the "
+                f"date constraint to see tenders that are still open."
+            )
+
+        if blocked_relevance > 0 and blocked_expired == 0:
+            broaden_hint = (
+                "Auto-broaden already ran and dropped the floor to 20%. "
+                if broadened
+                else "Try the 'Advanced filters' tab and lower the Min relevance slider."
+            )
+            return (
+                f"The agent found {blocked_relevance} candidate tenders with "
+                f"active deadlines but they all scored below the relevance "
+                f"floor for the SDS/EHS domain. {broaden_hint}"
+                f"Or refine your prompt with stronger domain keywords "
+                f"(e.g. 'SDS', 'GHS', 'REACH', 'hazardous')."
+            )
+
+        # Mixed case
         return (
-            "No verified tenders matched these filters. The most common cause "
-            "is too narrow a region+keyword combination. Try broadening keywords "
-            "or selecting 'Global' to fan out across all 20 sources."
+            f"The agent surfaced {total_candidates} candidate tenders but "
+            f"blocked all of them — {blocked_expired} had expired deadlines "
+            f"and {blocked_relevance} scored below the relevance floor. "
+            f"Try a broader date window and stronger SDS-domain keywords."
         )
 
     top = sorted(
@@ -2303,6 +2950,20 @@ def main() -> None:
     print("Press Ctrl+C to stop.")
     print("")
 
+    # Form-example ingestion runs on a slower cadence than search-jobs
+    # — Q&A extraction is non-urgent, and rate-limiting Voyage calls
+    # keeps embedding costs predictable. We pass the bridge's own
+    # MinIO download helper so the ingester stays HTTP-only.
+    _LAST_FORM_EXAMPLE_TICK = [0.0]
+    _FORM_EXAMPLE_INTERVAL_S = 60.0  # once a minute is plenty
+
+    def _download_from_minio(_bucket: str, key: str) -> str:
+        """Download a MinIO object to a temp file and return the path."""
+        tmp_dir = tempfile.mkdtemp(prefix="form_example_")
+        local_path = os.path.join(tmp_dir, os.path.basename(key) or "form_example.bin")
+        client.download_file(key, local_path)
+        return local_path
+
     try:
         while True:
             try:
@@ -2328,11 +2989,61 @@ def main() -> None:
                     if task_type == "fill_form":
                         mark_agent_task_running(client, task.get("id"))
                         handle_fill_form_task(client, task)
+                    elif task_type in ("fill_form_regenerate", "fill_form_revise"):
+                        # Human-in-the-loop revision cycle.
+                        #   regenerate → merge human edits + rewrite the
+                        #                four file formats (no LLM call).
+                        #   revise     → re-run FormFiller with human
+                        #                edits as anchors so blanks can
+                        #                fill via fresh inference.
+                        mark_agent_task_running(client, task.get("id"))
+                        handle_form_revision_task(
+                            client, task, use_llm=(task_type == "fill_form_revise")
+                        )
                     else:
                         print(f"  [agent-tasks] Skipping unknown task type: {task_type}")
             except Exception as exc:
                 print(f"  [agent-tasks loop] {exc}")
                 traceback.print_exc()
+
+            # Form-example ingestion (slow tick — 60s)
+            now = time.time()
+            if now - _LAST_FORM_EXAMPLE_TICK[0] >= _FORM_EXAMPLE_INTERVAL_S:
+                _LAST_FORM_EXAMPLE_TICK[0] = now
+                try:
+                    voyage_key = os.getenv("VOYAGE_API_KEY", "")
+                    if voyage_key:
+                        results = process_pending_form_examples(
+                            ams_url=NEXUS_URL,
+                            agent_name=_AGENT_NAME,
+                            minio_download_fn=_download_from_minio,
+                            voyage_api_key=voyage_key,
+                            auth_headers=_AUTH_HEADERS,
+                            timeout=30.0,
+                            max_docs=3,
+                        )
+                        for r in results:
+                            if r.error:
+                                print(
+                                    f"  [form-examples] doc={r.document_id[:8]}… "
+                                    f"ERROR: {r.error}"
+                                )
+                            elif r.skipped_reason:
+                                print(
+                                    f"  [form-examples] doc={r.document_id[:8]}… "
+                                    f"skipped: {r.skipped_reason}"
+                                )
+                            else:
+                                print(
+                                    f"  [form-examples] doc={r.document_id[:8]}… "
+                                    f"learned {r.pairs_pushed} Q&A pairs"
+                                )
+                    else:
+                        # No key — quietly skip; the warning was already logged at startup
+                        pass
+                except Exception as exc:
+                    print(f"  [form-examples loop] {exc}")
+                    traceback.print_exc()
 
             time.sleep(5.0)
 

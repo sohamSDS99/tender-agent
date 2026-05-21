@@ -242,6 +242,14 @@ class FormFiller:
             examples_used=sorted(examples_used),
         )
 
+    # Hard cap on fields per LLM call. At ~150 chars of JSON response
+    # per filled field, a 4000-token response can hold roughly 100
+    # fields — but staying well under that keeps each request fast,
+    # tolerant of long answers, and avoids mid-string truncation.
+    # The HHS Subcontracting Plan template alone has ~180 detected
+    # input boxes, so batching is essential, not optional.
+    LLM_BATCH_SIZE = 25
+
     def _llm_fill_fields(
         self,
         fields: list[FormField],
@@ -251,13 +259,61 @@ class FormFiller:
     ) -> tuple[list[FilledField], float, int]:
         """Use the LLM to fill form fields from context + past examples.
 
-        `field_examples` is a per-field dict of relevant past Q&A pairs
-        retrieved by vector similarity. When present, the prompt
-        includes them inline so the LLM has concrete grounding for
-        how this company has answered similar questions before.
+        For forms with many fields (e.g. the geometric parser commonly
+        emits >100 fields on flat PDFs with budget tables), splits the
+        call into batches of LLM_BATCH_SIZE so the JSON response
+        never truncates mid-string.
         """
 
         field_examples = field_examples or {}
+
+        if len(fields) <= self.LLM_BATCH_SIZE:
+            return self._llm_fill_batch(
+                fields, company_context, form_text, field_examples,
+                batch_label="1/1",
+            )
+
+        # Multi-batch path: split fields, call LLM once per chunk,
+        # merge results. Each batch sees the same company context
+        # and form text — only the field slice changes — so per-batch
+        # answers stay grounded in the same KB.
+        n_batches = (len(fields) + self.LLM_BATCH_SIZE - 1) // self.LLM_BATCH_SIZE
+        print(
+            f"  [filler] {len(fields)} fields → splitting into {n_batches} "
+            f"LLM batches of up to {self.LLM_BATCH_SIZE}"
+        )
+        all_filled: list[FilledField] = []
+        total_cost = 0.0
+        total_tokens = 0
+        for batch_idx in range(n_batches):
+            start = batch_idx * self.LLM_BATCH_SIZE
+            end = min(start + self.LLM_BATCH_SIZE, len(fields))
+            batch = fields[start:end]
+            label = f"{batch_idx + 1}/{n_batches}"
+            filled_batch, cost, tokens = self._llm_fill_batch(
+                batch, company_context, form_text, field_examples,
+                batch_label=label,
+            )
+            all_filled.extend(filled_batch)
+            total_cost += cost
+            total_tokens += tokens
+        return all_filled, total_cost, total_tokens
+
+    def _llm_fill_batch(
+        self,
+        fields: list[FormField],
+        company_context: str,
+        form_text: str,
+        field_examples: dict[str, list[dict[str, Any]]],
+        *,
+        batch_label: str = "1/1",
+    ) -> tuple[list[FilledField], float, int]:
+        """Run ONE LLM call against a single batch of fields.
+
+        Same prompt structure as before; max_tokens raised to 4000 so
+        a 25-field batch comfortably fits its JSON response (~150 chars
+        per field).
+        """
 
         # Build the field list for the prompt, with inline examples
         # where we have them. The LLM is told to PREFER the example
@@ -341,7 +397,8 @@ Respond with ONLY valid JSON (no markdown, no explanation). Use this structure:
 }}"""
 
         try:
-            result = self.llm_call(prompt, max_tokens=2000)
+            print(f"  [filler] LLM batch {batch_label}: {len(fields)} field(s)…")
+            result = self.llm_call(prompt, max_tokens=4000)
             content = result.get("content", "").strip()
             cost = result.get("cost_usd", 0.0)
             tokens = result.get("tokens_input", 0) + result.get("tokens_output", 0)

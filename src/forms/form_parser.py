@@ -97,9 +97,18 @@ class FormParser:
     def _parse_pdf(self, path: Path) -> ParseResult:
         """Extract fields from a PDF form.
 
-        Strategy:
-        1. Try AcroForm fields (fillable PDFs)
-        2. Fall back to text extraction + LLM field detection
+        Strategy, in order:
+
+        1. AcroForm widgets — modern fillable PDFs. Each widget
+           becomes a FormField with ``metadata['source']='acroform'``.
+        2. GEOMETRIC extraction (flat-PDF inputs drawn as boxes) —
+           uses the SAME box detection the writer uses, so every
+           field emitted here carries a ``box_anchor`` the writer
+           can place answers into without re-discovery. This replaces
+           the brittle ``_extract_fields_from_text`` heuristic for
+           any PDF that has visible input rectangles.
+        3. Text-pattern fallback — only if both AcroForm AND
+           geometric extraction find nothing. Last resort.
         """
         fields: list[FormField] = []
         raw_text = ""
@@ -170,7 +179,25 @@ class FormParser:
         except Exception as exc:
             errors.append(f"PDF parsing error: {exc}")
 
-        # Strategy 2: If no AcroForm fields, extract from text patterns
+        # Strategy 2: GEOMETRIC extraction — used for flat PDFs that
+        # have visible input rectangles drawn on the page but no real
+        # AcroForm widgets. Reuses the writer's box detector so every
+        # field carries a box_anchor and the writer can place answers
+        # without re-detection or name-matching.
+        if not fields:
+            try:
+                geom_fields, geom_errs = self._parse_pdf_geometric(path)
+                fields.extend(geom_fields)
+                errors.extend(geom_errs)
+            except Exception as exc:  # noqa: BLE001
+                # Geometric parser SHOULD be robust; if it crashes,
+                # record and fall through to text-pattern fallback.
+                errors.append(f"Geometric extraction failed: {exc}")
+
+        # Strategy 3: text-pattern fallback. Only if nothing else
+        # produced fields. This path produced lots of garbage in the
+        # past (e.g. "iod" from "Period") so we only hit it when both
+        # AcroForm and geometry came up empty.
         if not fields and raw_text:
             fields = self._extract_fields_from_text(raw_text)
 
@@ -183,6 +210,84 @@ class FormParser:
             title=path.stem,
             parse_errors=errors,
         )
+
+    def _parse_pdf_geometric(self, path: Path) -> tuple[list[FormField], list[str]]:
+        """Extract one field per detected input rectangle on a flat PDF.
+
+        Returns (fields, errors). The fields carry their box geometry
+        on ``metadata['box_anchor']`` so the writer can place answers
+        into the exact same rectangle — no re-detection, no label
+        matching against the field name.
+
+        Labels are deduplicated by appending positional disambiguators
+        (page + ordinal) when the same label appears more than once
+        (e.g. budget tables with many "$" amount boxes).
+        """
+        from collections import Counter
+        from .pdf_geometry import (
+            BoxAnchor, build_label_context, detect_input_boxes,
+        )
+
+        try:
+            import pdfplumber
+        except ImportError:
+            return [], ["pdfplumber not installed — cannot do geometric extraction"]
+
+        fields: list[FormField] = []
+        errors: list[str] = []
+
+        with pdfplumber.open(str(path)) as pdf:
+            # First pass: collect (page_idx, box, label) for every detected box.
+            raw: list[tuple[int, dict, str, float, float]] = []
+            for page_idx, page in enumerate(pdf.pages):
+                page_w, page_h = float(page.width), float(page.height)
+                boxes = detect_input_boxes(page)
+                words = page.extract_words(
+                    x_tolerance=2, y_tolerance=2,
+                    keep_blank_chars=False, use_text_flow=True,
+                )
+                for b in boxes:
+                    label = build_label_context(b, words).strip()
+                    raw.append((page_idx, b, label, page_w, page_h))
+
+            if not raw:
+                return [], []
+
+            # Disambiguate duplicate labels. If "$" appears on 80
+            # boxes, we'd lose every box but one in the FormFiller's
+            # name-keyed dict. Append "(p.N #M)" where N is the page
+            # and M is the within-page occurrence index of the label.
+            per_page_label_count: dict[tuple[int, str], int] = {}
+            label_total = Counter(label for _, _, label, _, _ in raw if label)
+            for page_idx, b, label, page_w, page_h in raw:
+                effective = label or f"unlabeled field p.{page_idx + 1}"
+
+                # If this label is unique across the whole doc, leave
+                # it as-is — gives the LLM a clean, unambiguous name.
+                if label_total.get(label, 0) > 1 or not label:
+                    key = (page_idx, effective)
+                    per_page_label_count[key] = per_page_label_count.get(key, 0) + 1
+                    occ = per_page_label_count[key]
+                    effective = f"{effective} (p.{page_idx + 1} #{occ})"
+
+                anchor = BoxAnchor(
+                    page_idx=page_idx,
+                    x0=float(b["x0"]), top=float(b["top"]),
+                    x1=float(b["x1"]), bottom=float(b["bottom"]),
+                    page_width=page_w, page_height=page_h,
+                )
+                fields.append(FormField(
+                    name=effective,
+                    field_type="text",
+                    page_or_section=f"page {page_idx + 1}",
+                    metadata={
+                        "source": "geometric",
+                        "box_anchor": anchor.to_dict(),
+                        "raw_label": label,
+                    },
+                ))
+
+        return fields, errors
 
     # -----------------------------------------------------------------------
     # DOCX Parsing

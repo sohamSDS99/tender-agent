@@ -73,6 +73,10 @@ from src.forms.form_example_ingester import (
     process_pending_form_examples,
     search_similar_examples,
 )
+from src.forms.attachment_fetcher import (
+    FetchedAttachment,
+    fetch_pursuit_attachments,
+)
 
 # Slack notifications
 from slack_notifier import (
@@ -956,6 +960,19 @@ def _lead_to_tender(lead, search_query: str) -> dict:
     if not submission_iso:
         return None
 
+    # Per-API attachment URLs (added Session 6).  Discovery modules that
+    # know about per-tender attachment links populate `attachment_urls`
+    # on the Lead so AMS can persist them and the bridge can skip HTML
+    # scraping when the operator promotes the tender to a pursuit.
+    raw_atts = getattr(lead, "attachment_urls", None) or []
+    if isinstance(raw_atts, list):
+        attachment_urls = [
+            str(u)[:2000] for u in raw_atts
+            if isinstance(u, str) and u.startswith("http")
+        ][:25]  # ceiling matches the bridge fetcher's per-pursuit cap
+    else:
+        attachment_urls = []
+
     return {
         "fingerprint": fp,
         "source": source,
@@ -973,6 +990,7 @@ def _lead_to_tender(lead, search_query: str) -> dict:
         "currency": currency,
         "url": (getattr(lead, "source_url", "") or "")[:2000],
         "cpvCode": (str(cpv)[:50] if cpv else None),
+        "attachmentUrls": attachment_urls,
         "relevanceScore": float(getattr(lead, "relevance_score", 0) or 0),
         "rawPayload": {
             "search_query": search_query,
@@ -1640,6 +1658,18 @@ def handle_fill_form_task(client: NexusClient, task: dict) -> None:
         # ignorant of HTTP.
         voyage_key = os.getenv("VOYAGE_API_KEY", "")
 
+        # Hard-disable past-Q&A retrieval when BRIDGE_SKIP_EXAMPLE_SEARCH
+        # is set. Useful for demos on the free Voyage tier — embedding
+        # every form question hits the 3 req/min rate limit fast and
+        # spams the log with 429s. Skipping the lookup means the LLM
+        # falls back to KB-only context (still produces a complete fill,
+        # just without the "this is how we answered before" few-shot
+        # grounding). Re-enable by clearing the env var once Voyage
+        # tier is upgraded.
+        skip_examples = os.getenv("BRIDGE_SKIP_EXAMPLE_SEARCH", "").lower() in (
+            "1", "true", "yes",
+        )
+
         def _example_search(question: str) -> list[dict]:
             if not voyage_key:
                 return []
@@ -1657,9 +1687,16 @@ def handle_fill_form_task(client: NexusClient, task: dict) -> None:
         filler = FormFiller(
             llm_call_fn=call_llm,
             confidence_threshold=0.7,
-            example_search_fn=_example_search if voyage_key else None,
+            example_search_fn=(
+                None if skip_examples else (_example_search if voyage_key else None)
+            ),
             examples_per_field=3,
         )
+        if skip_examples:
+            print(
+                "  [fill_form] BRIDGE_SKIP_EXAMPLE_SEARCH=true — "
+                "skipping per-question Voyage embeddings; KB-only mode."
+            )
         fill_result = filler.fill(parse_result, company_context)
         print(
             f"  [fill_form] Filled {fill_result.filled_count}/{fill_result.total_fields} "
@@ -1847,6 +1884,12 @@ def handle_form_revision_task(
             # so the LLM treats them as ground truth and only re-fills
             # the still-blank ones.
             voyage_key = os.getenv("VOYAGE_API_KEY", "")
+            # Same demo-mode toggle as initial fill — see comment in
+            # handle_fill_form_task. Honoured here so retries don't
+            # blow Voyage quota either.
+            skip_examples = os.getenv("BRIDGE_SKIP_EXAMPLE_SEARCH", "").lower() in (
+                "1", "true", "yes",
+            )
 
             def _example_search(question: str) -> list[dict]:
                 if not voyage_key:
@@ -1865,7 +1908,9 @@ def handle_form_revision_task(
             filler = FormFiller(
                 llm_call_fn=call_llm,
                 confidence_threshold=0.7,
-                example_search_fn=_example_search if voyage_key else None,
+                example_search_fn=(
+                    None if skip_examples else (_example_search if voyage_key else None)
+                ),
                 examples_per_field=3,
             )
             company_context = fetch_agent_context() or ""
@@ -2111,6 +2156,254 @@ def handle_form_revision_task(
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Tender attachment auto-fetch — triggered when operator selects a tender
+# for pursuit.  Pulls every downloadable file from the tender's source
+# page (or from the attachment URLs the discovery module already
+# harvested), uploads each to MinIO, and registers the documents on the
+# pursuit. AMS then shows them in the Pursuits side panel; the highest-
+# scoring file is auto-picked as the primary form to fill.
+# ---------------------------------------------------------------------------
+
+
+def handle_fetch_attachments_task(client: "NexusClient", task: dict) -> None:
+    """Process a fetch_pursuit_attachments AgentTask.
+
+    Task metadata schema (created by tenderPursuits.createBatch in AMS):
+        {
+          "type":      "fetch_pursuit_attachments",
+          "pursuitId": "<uuid>",
+          "tenderId":  "<uuid>",   # convenience only — not strictly needed
+          "tenderTitle": "..."
+        }
+
+    Side effects:
+        - Pulls (sourceUrl, attachmentUrls) from AMS for the pursuit.
+        - Downloads each attachment (HTML-scrape fallback when the API
+          didn't expose any direct URLs).
+        - Uploads each to MinIO via NexusClient.upload_file.
+        - POSTs the catalogue back to AMS, which creates Document rows
+          tagged with pursuitId and sets primaryFormDocumentId.
+        - Marks the AgentTask complete.
+
+    The handler never fails the whole task on download errors — it
+    posts a partial result (or a "no attachments found" note) so the
+    UI can show the operator a useful state instead of hanging.
+    """
+
+    start_time = time.perf_counter()
+    task_id = task.get("id")
+    metadata = task.get("metadata") or {}
+    pursuit_id = metadata.get("pursuitId")
+    tender_title = metadata.get("tenderTitle") or "(unknown tender)"
+
+    # Small helper — every complete_agent_task call below needs a
+    # duration in ms. Compute it at call time so it reflects however
+    # long we spent before hitting that exit path.
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - start_time) * 1000)
+
+    if not pursuit_id:
+        msg = "fetch_pursuit_attachments task missing metadata.pursuitId"
+        print(f"  [fetch-att] ERROR: {msg}")
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg, duration_ms=_elapsed_ms())
+        return
+
+    print(f"  [fetch-att] Starting attachment fetch for pursuit {pursuit_id[:8]} "
+          f"— {tender_title[:80]}")
+
+    # ------------------------------------------------------------------
+    # 1) Ask AMS for the source URL + any pre-harvested attachment URLs
+    # ------------------------------------------------------------------
+    try:
+        src_url = _ams_url(f"/api/tender-pursuits/{pursuit_id}/source")
+        # follow_redirects=True so a (rare) auth-middleware redirect
+        # surfaces as a clear 4xx instead of silently 200ing on /login.
+        resp = _httpx.get(src_url, headers=_AUTH_HEADERS, timeout=15.0,
+                          follow_redirects=True)
+        resp.raise_for_status()
+        source_payload = resp.json() or {}
+    except Exception as exc:
+        msg = f"Could not load pursuit source: {exc}"
+        print(f"  [fetch-att] {msg}")
+        _patch_pursuit_attachment_status(
+            pursuit_id, status="failed", error=msg
+        )
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg[:500],
+                            duration_ms=_elapsed_ms())
+        return
+
+    tender_source_url = source_payload.get("sourceUrl") or source_payload.get("url")
+    api_attachment_urls = source_payload.get("attachmentUrls") or []
+
+    if not tender_source_url and not api_attachment_urls:
+        note = "Tender has no source URL or attachment URLs — nothing to fetch."
+        print(f"  [fetch-att] {note}")
+        _patch_pursuit_attachment_status(pursuit_id, status="skipped", error=None)
+        _post_pursuit_attachments(pursuit_id, attachments=[], note=note)
+        complete_agent_task(client, task_id, status="completed",
+                            result_summary=note,
+                            duration_ms=_elapsed_ms())
+        return
+
+    # ------------------------------------------------------------------
+    # 2) Run the fetcher (downloads files into a temp dir)
+    # ------------------------------------------------------------------
+    tmp_dir = tempfile.mkdtemp(prefix=f"pursuit_{pursuit_id[:8]}_")
+    try:
+        result = fetch_pursuit_attachments(
+            source_url=tender_source_url,
+            api_attachment_urls=api_attachment_urls,
+            dest_dir=tmp_dir,
+        )
+
+        if not result.attachments:
+            note = result.note or "No attachments downloaded."
+            print(f"  [fetch-att] {note}")
+            _patch_pursuit_attachment_status(
+                pursuit_id,
+                status="skipped" if "no downloadable" in (note or "").lower() else "failed",
+                error=note,
+            )
+            _post_pursuit_attachments(pursuit_id, attachments=[], note=note)
+            complete_agent_task(client, task_id, status="completed",
+                                result_summary=note[:500],
+                                duration_ms=_elapsed_ms())
+            return
+
+        # --------------------------------------------------------------
+        # 3) Upload each file to MinIO via the existing NexusClient
+        # --------------------------------------------------------------
+        uploaded: list[dict] = []
+        for att in result.attachments:
+            try:
+                up = client.upload_file(att.local_path, filename=att.filename)
+                att.minio_key = up.get("minioKey")
+                uploaded.append({
+                    "filename": att.filename,
+                    "mimeType": att.mime_type,
+                    "sizeBytes": att.size_bytes,
+                    "minioKey": att.minio_key,
+                    "sourceUrl": att.source_url,
+                    "score": att.score,
+                    "isPrimary": att.is_primary,
+                })
+                print(f"  [fetch-att] uploaded {att.filename} "
+                      f"({att.size_bytes} bytes, score={att.score:.2f}"
+                      f"{', PRIMARY' if att.is_primary else ''})")
+            except Exception as exc:
+                print(f"  [fetch-att] upload failed for {att.filename}: {exc}")
+
+        if not uploaded:
+            note = "All downloaded attachments failed to upload to MinIO."
+            print(f"  [fetch-att] {note}")
+            _patch_pursuit_attachment_status(pursuit_id, status="failed", error=note)
+            complete_agent_task(client, task_id, status="failed",
+                                result_summary=note,
+                                duration_ms=_elapsed_ms())
+            return
+
+        # --------------------------------------------------------------
+        # 4) Tell AMS about the new documents.  AMS creates Document
+        #    rows tagged with pursuitId + sets primaryFormDocumentId.
+        # --------------------------------------------------------------
+        post_result = _post_pursuit_attachments(
+            pursuit_id, attachments=uploaded, note=result.note
+        )
+
+        primary_label = next(
+            (a["filename"] for a in uploaded if a.get("isPrimary")), None
+        )
+        summary = (
+            f"Fetched {len(uploaded)} attachment(s) "
+            f"({'primary: ' + primary_label if primary_label else 'no primary picked'})."
+        )
+        print(f"  [fetch-att] {summary}")
+
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        _audit("task_completed", summary,
+               node_name="fetch_pursuit_attachments",
+               duration_ms=duration_ms,
+               output_payload={"pursuit_id": pursuit_id,
+                               "attachment_count": len(uploaded),
+                               "primary": primary_label,
+                               "ams_response": post_result})
+        complete_agent_task(client, task_id, status="completed",
+                            result_summary=summary[:500],
+                            duration_ms=duration_ms,
+                            metadata={"pursuit_id": pursuit_id,
+                                      "attachment_count": len(uploaded),
+                                      "primary_filename": primary_label})
+
+    except Exception as exc:
+        traceback.print_exc()
+        msg = f"Attachment fetch failed: {exc}"
+        print(f"  [fetch-att] {msg}")
+        _patch_pursuit_attachment_status(pursuit_id, status="failed", error=msg)
+        complete_agent_task(client, task_id, status="failed",
+                            result_summary=msg[:500],
+                            duration_ms=_elapsed_ms())
+        _audit("task_failed", msg, status="failure",
+               error_message=str(exc),
+               node_name="fetch_pursuit_attachments",
+               input_payload={"pursuit_id": pursuit_id})
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _patch_pursuit_attachment_status(
+    pursuit_id: str, *, status: str, error: str | None
+) -> None:
+    """PATCH /api/tender-pursuits/{id} to set attachmentFetchStatus.
+
+    The /attachments POST below ALSO sets the status when it succeeds —
+    this helper is only for the early-out paths (no source URL, source
+    page 4xx, etc.) so the UI doesn't spin forever.
+    """
+
+    try:
+        url = _ams_url(f"/api/tender-pursuits/{pursuit_id}")
+        payload: dict = {"attachmentFetchStatus": status,
+                         "attachmentFetchedAt": datetime.now(timezone.utc).isoformat()}
+        if error is not None:
+            payload["attachmentFetchError"] = str(error)[:1000]
+        _httpx.patch(url, json=payload, headers=_AUTH_HEADERS, timeout=10.0)
+    except Exception as exc:
+        print(f"  [fetch-att] status-patch failed: {exc}")
+
+
+def _post_pursuit_attachments(
+    pursuit_id: str,
+    *,
+    attachments: list[dict],
+    note: str | None = None,
+) -> dict:
+    """POST /api/tender-pursuits/{id}/attachments — register the documents.
+
+    AMS creates a Document row per entry (category=tender_attachment,
+    pursuitId=this), sets primaryFormDocumentId from whichever entry
+    has isPrimary=true, and stamps attachmentFetchStatus accordingly.
+    """
+
+    try:
+        url = _ams_url(f"/api/tender-pursuits/{pursuit_id}/attachments")
+        payload = {"attachments": attachments, "note": note}
+        resp = _httpx.post(url, json=payload, headers=_AUTH_HEADERS, timeout=20.0)
+        if resp.status_code >= 400:
+            print(f"  [fetch-att] AMS POST returned {resp.status_code}: "
+                  f"{resp.text[:300]}")
+            return {"error": resp.text[:300]}
+        return resp.json() if resp.content else {}
+    except Exception as exc:
+        print(f"  [fetch-att] AMS POST failed: {exc}")
+        return {"error": str(exc)}
 
 
 def _submit_filled_form(
@@ -3000,6 +3293,15 @@ def main() -> None:
                         handle_form_revision_task(
                             client, task, use_llm=(task_type == "fill_form_revise")
                         )
+                    elif task_type == "fetch_pursuit_attachments":
+                        # Auto-fetch the tender's downloadable attachments
+                        # (PDF/DOCX/XLSX/ZIP) from its source URL the
+                        # moment a pursuit is created.  The most form-
+                        # like file is auto-picked as the primary so the
+                        # operator can hit "Agent fill" without a
+                        # manual upload step.
+                        mark_agent_task_running(client, task.get("id"))
+                        handle_fetch_attachments_task(client, task)
                     else:
                         print(f"  [agent-tasks] Skipping unknown task type: {task_type}")
             except Exception as exc:

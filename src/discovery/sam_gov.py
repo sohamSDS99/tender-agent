@@ -123,6 +123,10 @@ class TenderLead:
     posted_date: str = ""
     relevance_score: float = 0.0
     relevance_keywords: list[str] = field(default_factory=list)
+    # Direct download URLs the SAM.gov API surfaced for this opportunity
+    # (resourceLinks).  When non-empty, the bridge skips HTML scraping
+    # and downloads these directly during pursuit-attachment fetch.
+    attachment_urls: list[str] = field(default_factory=list)
     raw_data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -138,6 +142,7 @@ class TenderLead:
             "posted_date": self.posted_date,
             "relevance_score": self.relevance_score,
             "relevance_keywords": self.relevance_keywords,
+            "attachment_urls": self.attachment_urls,
         }
 
 
@@ -367,15 +372,48 @@ class SamGovScraper:
                     posted = opp.get("postedDate", "")
                     sol_number = opp.get("solicitationNumber", str(uuid.uuid4())[:12])
 
+                    # SAM.gov exposes attachment URLs via `resourceLinks`
+                    # (a list of direct file URLs).  When the operator
+                    # later promotes this lead to a pursuit, the bridge
+                    # picks these up via /api/tender-pursuits/<id>/source
+                    # and downloads them directly — skipping the
+                    # HTML-scraping fallback path entirely.
+                    raw_links = opp.get("resourceLinks") or []
+                    attachment_urls: list[str] = []
+                    if isinstance(raw_links, list):
+                        for link in raw_links:
+                            if isinstance(link, str) and link.startswith("http"):
+                                attachment_urls.append(link)
+                            elif isinstance(link, dict):
+                                # SAM.gov has been seen returning both
+                                # bare strings and dicts shaped like
+                                # {"url": "..."} depending on the
+                                # opportunity type.  Tolerate both.
+                                u = link.get("url") or link.get("href")
+                                if isinstance(u, str) and u.startswith("http"):
+                                    attachment_urls.append(u)
+
+                    # SAM.gov requires the `/view` suffix on the
+                    # opportunity URL.  Without it the public site 404s
+                    # (the noticeId path alone is the API resource, not
+                    # the rendered detail page).
+                    notice_id = opp.get("noticeId", "")
+                    source_url = (
+                        f"https://sam.gov/opp/{notice_id}/view"
+                        if notice_id
+                        else "https://sam.gov/"
+                    )
+
                     leads.append(TenderLead(
                         lead_id=sol_number,
                         title=opp.get("title", "Untitled"),
                         description=opp.get("description", "")[:2000],
                         agency=opp.get("fullParentPathName", "Unknown Agency"),
-                        source_url=f"https://sam.gov/opp/{opp.get('noticeId', '')}",
+                        source_url=source_url,
                         naics_code=naics,
                         submission_deadline=deadline,
                         posted_date=posted,
+                        attachment_urls=attachment_urls,
                         raw_data=opp,
                     ))
 

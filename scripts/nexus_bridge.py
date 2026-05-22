@@ -64,6 +64,17 @@ from src.discovery.nigeria_nocopo import NigeriaNocopoSearcher
 from src.discovery.kenya_ppra import KenyaPpraSearcher
 from src.discovery.uganda_gpp import UgandaGppSearcher
 from src.discovery.mexico_cdmx import MexicoCdmxSearcher
+# New (session-7) discovery sources — 6 stable + UNGM niche (auto-disabled
+# until UNGM_API_KEY is set). Each module follows the sa_etender pattern
+# of multi-endpoint probing + defensive [] return on any failure, so a
+# broken endpoint surfaces as "no leads" not a bridge crash.
+from src.discovery.uk_fts import UkFtsSearcher
+from src.discovery.norway_doffin import NorwayDoffinSearcher
+from src.discovery.ireland_etenders import IrelandETendersSearcher
+from src.discovery.switzerland_simap import SwitzerlandSimapSearcher
+from src.discovery.singapore_gebiz import SingaporeGebizSearcher
+from src.discovery.nz_gets import NzGetsSearcher
+from src.discovery.ungm import UngmSearcher
 
 # Import form processing modules
 from src.forms.form_parser import FormParser
@@ -1125,6 +1136,22 @@ def run_tender_search(filters: dict) -> dict:
     def _mexico():
         return MexicoCdmxSearcher().search(user_query=search_query, max_results=10, days_back=60)
 
+    # ----- Session-7 additions -----
+    def _uk_fts():
+        return UkFtsSearcher().search(user_query=search_query, max_results=15, days_back=60)
+    def _doffin():
+        return NorwayDoffinSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _ireland():
+        return IrelandETendersSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _simap():
+        return SwitzerlandSimapSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _gebiz():
+        return SingaporeGebizSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _nz_gets():
+        return NzGetsSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _ungm():
+        return UngmSearcher().search(user_query=search_query, max_results=10, days_back=60)
+
     # Sources whose upstream JSON endpoints have been retired or changed
     # without backward compat (verified May 2026). Skipping them avoids
     # 20-30s of wasted retries per search. Re-enable any of these when
@@ -1229,6 +1256,27 @@ def run_tender_search(filters: dict) -> dict:
         _add("uganda_gpp", _uganda)
     if region_match("south_america", "global") and src_on("mexico_cdmx"):
         _add("mexico_cdmx", _mexico)
+
+    # Session-7 additions — wired up with sensible region matches so the
+    # global default keyword "everywhere" lights up the whole set while
+    # narrower searches still pull in just the matching regions.
+    if region_match("uk", "europe", "global") and src_on("uk_fts"):
+        _add("uk_fts", _uk_fts)
+    if region_match("europe", "nordics", "global") and src_on("norway_doffin"):
+        _add("norway_doffin", _doffin)
+    if region_match("europe", "uk", "global") and src_on("ireland_etenders"):
+        _add("ireland_etenders", _ireland)
+    if region_match("europe", "global") and src_on("switzerland_simap"):
+        _add("switzerland_simap", _simap)
+    if region_match("asia", "singapore", "global") and src_on("singapore_gebiz"):
+        _add("singapore_gebiz", _gebiz)
+    if region_match("pacific", "australia", "global") and src_on("nz_gets"):
+        _add("nz_gets", _nz_gets)
+    if region_match("global", "un", "africa", "asia") and src_on("ungm"):
+        # UNGM self-disables internally when UNGM_API_KEY is unset, so
+        # we register it unconditionally — the searcher will return []
+        # in zero ms if no key is present.
+        _add("ungm", _ungm)
 
     print(f"  Fanning out to {len(api_jobs)} live APIs in parallel "
           f"({len(KNOWN_BROKEN_APIS)} known-broken skipped)…")

@@ -54,14 +54,39 @@ logger = structlog.get_logger(__name__)
 
 SAM_API_BASE = "https://api.sam.gov/opportunities/v2/search"
 
-# NAICS codes relevant to EHS/SDS software
+# NAICS codes relevant to EHS / SDS / chemical-safety federal contracts.
+# Expanded session-7 to cover chemical manufacturing, testing labs,
+# hazardous-waste handling, lab supplies, and safety training in
+# addition to the original software/consulting cluster.
 RELEVANT_NAICS: list[str] = [
+    # --- core scoring set (session-1) ---
     "541620",  # Environmental Consulting Services
     "541690",  # Other Scientific and Technical Consulting
     "511210",  # Software Publishers
     "541512",  # Computer Systems Design Services
     "541519",  # Other Computer Related Services
     "562910",  # Environmental Remediation Services
+    # --- chemical manufacturing (3251xx / 3252xx / 3259xx) ---
+    "325",     # Chemical mfg (broad prefix catch)
+    "325180",  # Other Basic Inorganic Chemical Manufacturing
+    "325199",  # All Other Basic Organic Chemical Manufacturing
+    "325410",  # Pharmaceutical & Medicine Manufacturing
+    "325510",  # Paint & Coating Manufacturing
+    "325611",  # Soap & Other Detergent Manufacturing
+    "325998",  # All Other Misc Chemical Product / Preparation
+    # --- testing & analysis labs ---
+    "541380",  # Testing Laboratories
+    "541713",  # Research and Development in Nanotechnology
+    "541714",  # R&D in Biotech (except nano)
+    "541715",  # R&D in Physical/Engineering/Life Sciences
+    # --- hazardous waste & remediation ---
+    "562112",  # Hazardous Waste Collection
+    "562211",  # Hazardous Waste Treatment & Disposal
+    "562112",  # (dup intentional — kept for grep visibility)
+    "562998",  # All Other Misc Waste Management Services
+    # --- training in safety ---
+    "611430",  # Professional & Management Development Training
+    "611699",  # All Other Misc Schools & Instruction
 ]
 
 # Keywords that indicate EHS/SDS/chemical safety relevance

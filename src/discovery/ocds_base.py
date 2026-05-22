@@ -54,15 +54,38 @@ PARTIAL_KEYWORDS: list[str] = [
     "waste management", "pollution", "contamination",
 ]
 
-# CPV codes relevant to SDS/EHS
+# CPV codes (EU Common Procurement Vocabulary) relevant to SDS / EHS /
+# chemical-safety / lab work. Used by every OCDS-based source for the
+# 0.15 CPV bonus in score_relevance().
+#
+# Expanded session-7 to surface more chemical-adjacent procurement:
+# industrial chemicals, lab instruments, pollution monitoring, hazmat
+# transport, safety training, and R&D services.
 RELEVANT_CPV_PREFIXES: list[str] = [
-    "905",      # Environmental services
-    "713172",   # Health and safety services
-    "480000",   # Software packages
-    "720000",   # IT services
-    "334212",   # Safety equipment
-    "331410",   # Industrial chemicals
-    "905240",   # Hazardous waste management
+    # --- core SDS / chemical safety ---
+    "905",       # Environmental services (broad)
+    "713172",    # Health and safety services
+    "33141",     # Medical / lab chemicals (33141500 = serums etc.)
+    "33342",     # Safety equipment (33342000)
+    "33680",     # Pharmaceutical products + reagents
+    "331410",    # Industrial chemicals
+    "24",        # Chemical products (24*)  ← broadest catch
+    # --- environmental & hazmat ---
+    "9051",      # Refuse + waste services
+    "9052",      # Hazardous / toxic / radioactive waste (90520000)
+    "905240",    # Hazardous waste management (specific)
+    "9073",      # Environmental monitoring / pollution measurement
+    "606",       # Transport of hazardous goods (60600000-class)
+    # --- lab + testing + analysis ---
+    "38540",     # Laboratory instruments (38540000)
+    "71621",     # Technical analysis / consultancy services
+    "7300",      # R&D services
+    # --- safety training + consulting ---
+    "79417",     # Safety consultancy services
+    "80511",     # Staff safety training
+    # --- enabling tech ---
+    "480000",    # Software packages
+    "720000",    # IT services
 ]
 
 

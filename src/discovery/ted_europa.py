@@ -43,16 +43,35 @@ logger = structlog.get_logger(__name__)
 # fan-out keeps moving.
 TED_API_URL = "https://api.ted.europa.eu/v3/notices/search"
 
-# CPV codes relevant to SDS/EHS/chemical safety software
+# CPV codes (TED's classification) used for the 0.15 CPV bonus in the
+# TED-specific scoring. Expanded session-7 to mirror the broader
+# ocds_base.RELEVANT_CPV_PREFIXES list so TED results benefit from the
+# same widened niche coverage applied to OCDS sources.
 # See: https://simap.ted.europa.eu/cpv
 RELEVANT_CPV_CODES: list[str] = [
-    "905",      # Environmental services (broad)
-    "7131720",  # Health and safety services
-    "4800000",  # Software package and information systems
-    "7200000",  # IT services: consulting, development, support
-    "3342120",  # Safety equipment
-    "3314100",  # Industrial chemicals
-    "9052400",  # Hazardous waste management
+    # core SDS / chemical safety
+    "905",        # Environmental services (broad)
+    "7131720",    # Health and safety services
+    "33141",      # Medical / lab chemicals
+    "3342120",    # Safety equipment
+    "33680",      # Pharmaceutical products + reagents
+    "331410",     # Industrial chemicals
+    "24",         # Chemical products (broad)
+    # environmental & hazmat
+    "9051",       # Refuse + waste services
+    "9052400",    # Hazardous waste management
+    "9073",       # Environmental monitoring / pollution measurement
+    "606",        # Transport of hazardous goods
+    # lab + testing + analysis
+    "38540",      # Laboratory instruments
+    "71621",      # Technical analysis / consultancy
+    "7300",       # R&D services
+    # safety training + consulting
+    "79417",      # Safety consultancy
+    "80511",      # Staff safety training
+    # enabling tech
+    "4800000",    # Software packages
+    "7200000",    # IT services
 ]
 
 # Full-text search terms for SDS/EHS domain

@@ -74,7 +74,7 @@ from src.discovery.ireland_etenders import IrelandETendersSearcher
 from src.discovery.switzerland_simap import SwitzerlandSimapSearcher
 from src.discovery.singapore_gebiz import SingaporeGebizSearcher
 from src.discovery.nz_gets import NzGetsSearcher
-from src.discovery.ungm import UngmSearcher
+from src.discovery.eu_funding_tenders import EuFundingTendersSearcher
 
 # Import form processing modules
 from src.forms.form_parser import FormParser
@@ -1149,8 +1149,8 @@ def run_tender_search(filters: dict) -> dict:
         return SingaporeGebizSearcher().search(user_query=search_query, max_results=10, days_back=60)
     def _nz_gets():
         return NzGetsSearcher().search(user_query=search_query, max_results=10, days_back=60)
-    def _ungm():
-        return UngmSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _eu_ft():
+        return EuFundingTendersSearcher().search(user_query=search_query, max_results=10, days_back=60)
 
     # Sources whose upstream JSON endpoints have been retired or changed
     # without backward compat (verified May 2026). Skipping them avoids
@@ -1272,11 +1272,12 @@ def run_tender_search(filters: dict) -> dict:
         _add("singapore_gebiz", _gebiz)
     if region_match("pacific", "australia", "global") and src_on("nz_gets"):
         _add("nz_gets", _nz_gets)
-    if region_match("global", "un", "africa", "asia") and src_on("ungm"):
-        # UNGM self-disables internally when UNGM_API_KEY is unset, so
-        # we register it unconditionally — the searcher will return []
-        # in zero ms if no key is present.
-        _add("ungm", _ungm)
+    if region_match("europe", "global") and src_on("eu_funding_tenders"):
+        # EU Funding & Tenders Portal — covers EU institutional buyers
+        # (DG ENV, DG SANTE, ECHA, EFSA, JRC) that are heavy purchasers
+        # of chemical-safety consulting + SDS work. Public SEDIA API,
+        # no auth required.
+        _add("eu_funding_tenders", _eu_ft)
 
     print(f"  Fanning out to {len(api_jobs)} live APIs in parallel "
           f"({len(KNOWN_BROKEN_APIS)} known-broken skipped)…")

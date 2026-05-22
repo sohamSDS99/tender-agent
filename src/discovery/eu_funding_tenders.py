@@ -171,11 +171,19 @@ class EuFundingTendersSearcher:
             "pageSize": "50",
             "pageNumber": "1",
         }
-        # Body filters: tender type, active status
+        # Body filters: tender type, status = OPEN ONLY (no forthcoming).
+        # SEDIA status codes:
+        #   31094501 = Forthcoming  — opening date in the future, no
+        #                              bids yet. Operator can't act on
+        #                              these so we DELIBERATELY exclude.
+        #   31094502 = Open         — currently accepting submissions.
+        #   31094503 = Closed       — past deadline, useless to surface.
+        # Locking to Open prevents the agent from reporting calls that
+        # haven't actually opened (red flag in operator workflows).
         body = {
             "languages": ["en"],
-            "type": ["1", "2"],          # 1 = call for tender, 2 = call for proposal (covers both)
-            "status": ["31094501", "31094502"],  # forthcoming + open
+            "type": ["1", "2"],          # 1 = call for tender, 2 = call for proposal
+            "status": ["31094502"],      # OPEN only — never forthcoming
         }
         try:
             with httpx.Client(
@@ -304,10 +312,22 @@ class EuFundingTendersSearcher:
                         pass
 
                 # Skip if posted before our look-back window
+                # AND skip if posted in the future (defensive: would
+                # mean a Forthcoming-status tender slipped past the
+                # SEDIA query filter — should never happen but cheap
+                # to double-check). Operators should never see a
+                # tender that hasn't actually opened yet.
                 if lead.posted_date:
                     try:
                         pd = datetime.strptime(lead.posted_date, "%Y-%m-%d").date()
                         if pd < cutoff.date():
+                            continue
+                        if pd > now.date():
+                            logger.info(
+                                "eu_ft_dropped_forthcoming",
+                                lead_id=lead.lead_id,
+                                posted_date=lead.posted_date,
+                            )
                             continue
                     except Exception:
                         pass

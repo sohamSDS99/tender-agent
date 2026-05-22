@@ -207,9 +207,35 @@ def parse_ocds_release(
     if not buyer_name:
         buyer_name = "Government"
 
+    # Reject tenders that haven't opened yet (status "planning" /
+    # "planned") so operators never see forthcoming calls in their
+    # Inbox. OCDS tender.status vocabulary:
+    #   planning   — internal planning, not public
+    #   planned    — published intent, no bids accepted yet
+    #   active     — accepting bids (what we want)
+    #   cancelled / unsuccessful / complete / withdrawn — terminal
+    tender_status = (tender.get("status") or "").lower()
+    if tender_status in ("planning", "planned"):
+        return None
+
     # Extract deadline (tenderPeriod.endDate)
     tender_period = tender.get("tenderPeriod", {})
     deadline = tender_period.get("endDate", "")
+
+    # Reject if the tender hasn't opened for bids yet — startDate
+    # in the future is the OCDS-shape equivalent of EU F&T's
+    # "forthcoming" status. Same operator-experience rule applies:
+    # don't surface calls that aren't actually accepting submissions.
+    start_date_raw = tender_period.get("startDate", "")
+    if start_date_raw:
+        start_iso = _parse_date(start_date_raw)
+        if start_iso:
+            try:
+                sd = datetime.strptime(start_iso, "%Y-%m-%d").date()
+                if sd > datetime.now(timezone.utc).date():
+                    return None
+            except Exception:
+                pass
 
     # Posted date
     posted_date = release.get("date", "")

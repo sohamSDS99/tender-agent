@@ -25,6 +25,7 @@ Press Ctrl+C to stop.
 
 import json
 import os
+import re
 import sys
 import time
 import shutil
@@ -87,6 +88,20 @@ from src.forms.form_example_ingester import (
 from src.forms.attachment_fetcher import (
     FetchedAttachment,
     fetch_pursuit_attachments,
+)
+# Session 8 — multi-channel submission.  classify_submission decides
+# whether a tender wants a form upload, an emailed proposal, a portal
+# submission, or a mix; email_draft_writer turns "email channel" into
+# an operator-approvable draft.  Both are pure (no I/O) so the bridge
+# stays in charge of HTTP / DB writes.
+from src.forms.submission_classifier import (
+    SubmissionClassification,
+    classify_submission,
+)
+from src.forms.email_draft_writer import (
+    EmailDraftResult,
+    EmailDraftWriter,
+    SuggestedAttachment,
 )
 
 # Slack notifications
@@ -2928,6 +2943,950 @@ def mark_pursuit_status(
         print(f"  [mark_pursuit_status {pursuit_id}] {exc}")
 
 
+# =============================================================================
+# Session 8 — Multi-channel submission handlers
+# =============================================================================
+# Three new agent-task types share the same shape as the existing
+# fetch_pursuit_attachments + fill_form pair:
+#
+#   classify_submission       — runs the regex classifier; POSTs channel
+#                               + extracted contact to AMS.  Fires the
+#                               moment a pursuit is created (alongside
+#                               fetch_pursuit_attachments).
+#   draft_email_submission    — operator-triggered "Draft email with
+#                               Agent".  Builds an EmailDraftResult and
+#                               POSTs a Submission row with action_type
+#                               'email_submission'.
+#   draft_email_regenerate /
+#   draft_email_revise        — HITL revision passes, same shape as
+#                               fill_form_regenerate / fill_form_revise
+#                               for the form path.
+#
+# All three follow the existing error-handling contract: never leave the
+# UI spinning, always close out the AgentTask with a result_summary, and
+# audit every state change so /audit + the bridge log can reconstruct
+# what happened from the operator's chair.
+# =============================================================================
+
+
+def _patch_pursuit_classification(
+    pursuit_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """PATCH /api/tender-pursuits/{id} — set classification_status.
+
+    The companion POST /classification below ALSO sets the status when
+    it succeeds — this helper covers the early-out paths (no source
+    URL, classifier crash) so the side panel never spins forever.
+    """
+
+    try:
+        url = _ams_url(f"/api/tender-pursuits/{pursuit_id}")
+        payload: dict = {
+            "classificationStatus": status,
+            "classifiedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        if error is not None:
+            payload["classificationError"] = str(error)[:1000]
+        _httpx.patch(url, json=payload, headers=_AUTH_HEADERS, timeout=10.0)
+    except Exception as exc:
+        print(f"  [classify] status-patch failed: {exc}")
+
+
+def _post_pursuit_classification(
+    pursuit_id: str,
+    *,
+    classification: SubmissionClassification,
+) -> dict:
+    """POST /api/tender-pursuits/{id}/classification — persist the result.
+
+    AMS writes the channel + extracted contact onto the pursuit row,
+    flips classification_status to 'completed', and combines our
+    text-based channel with the attachment-fetch result (e.g. promotes
+    'email' → 'hybrid' when the fetcher returned a form).
+    """
+
+    payload = {
+        "channel": classification.channel,
+        "confidence": classification.confidence,
+        "contactEmail": classification.contact_email,
+        "contactCc": classification.contact_cc,
+        "instructions": classification.instructions,
+        "language": classification.language,
+        "reasoning": classification.reasoning,
+    }
+    try:
+        url = _ams_url(f"/api/tender-pursuits/{pursuit_id}/classification")
+        resp = _httpx.post(url, json=payload, headers=_AUTH_HEADERS, timeout=15.0)
+        if resp.status_code >= 400:
+            print(
+                f"  [classify] AMS POST returned {resp.status_code}: "
+                f"{resp.text[:300]}"
+            )
+            return {"error": resp.text[:300]}
+        return resp.json() if resp.content else {}
+    except Exception as exc:
+        print(f"  [classify] AMS POST failed: {exc}")
+        return {"error": str(exc)}
+
+
+def handle_classify_submission_task(client: "NexusClient", task: dict) -> None:
+    """Process a classify_submission AgentTask.
+
+    Task metadata (from tenderPursuits.createBatch):
+        {
+          "type":            "classify_submission",
+          "pursuitId":       "<uuid>",
+          "tenderId":        "<uuid>",
+          "tenderTitle":     "...",
+          "tenderUrl":       "...",
+          "tenderDescription": "..." (may be truncated; we re-fetch via
+                                      /source if needed)
+        }
+
+    The classifier is purely deterministic regex over the tender's
+    title + description + source-page text.  We do NOT block on the
+    attachment fetcher — AMS combines our text-based channel with
+    the fetcher's result when writing to the pursuit row.
+    """
+
+    start_time = time.perf_counter()
+    task_id = task.get("id")
+    metadata = task.get("metadata") or {}
+    pursuit_id = metadata.get("pursuitId")
+    tender_title = metadata.get("tenderTitle") or "(unknown tender)"
+    tender_url = metadata.get("tenderUrl") or ""
+    tender_description = metadata.get("tenderDescription") or ""
+
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - start_time) * 1000)
+
+    if not pursuit_id:
+        msg = "classify_submission task missing metadata.pursuitId"
+        print(f"  [classify] ERROR: {msg}")
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg, duration_ms=_elapsed_ms(),
+        )
+        return
+
+    print(
+        f"  [classify] Starting channel classification for pursuit "
+        f"{pursuit_id[:8]} — {tender_title[:80]}"
+    )
+
+    # If the description / URL are missing from the task payload (could
+    # happen on a retry) we try to recover them from /api/tender-pursuits.
+    if not tender_description or not tender_url:
+        try:
+            src_url = _ams_url(f"/api/tender-pursuits/{pursuit_id}/source")
+            resp = _httpx.get(
+                src_url, headers=_AUTH_HEADERS,
+                timeout=15.0, follow_redirects=True,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            tender_url = tender_url or payload.get("sourceUrl") or payload.get("url") or ""
+            # /source doesn't carry the description (it's only the URL +
+            # attachmentUrls).  That's fine — classifier degrades gracefully.
+        except Exception as exc:
+            print(f"  [classify] pursuit source fetch failed: {exc}")
+
+    try:
+        classification = classify_submission(
+            tender_title=tender_title,
+            tender_description=tender_description,
+            source_url=tender_url or None,
+            source_page_text=None,           # let the classifier fetch
+            has_form_attachment=False,        # AMS combines with fetch result
+            fetch_source_when_missing=True,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        msg = f"Classifier crashed: {exc}"
+        print(f"  [classify] {msg}")
+        _patch_pursuit_classification(pursuit_id, status="failed", error=msg)
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg[:500], duration_ms=_elapsed_ms(),
+        )
+        _audit(
+            "task_failed", msg, status="failure",
+            node_name="classify_submission",
+            error_message=str(exc),
+            input_payload={"pursuit_id": pursuit_id, "task_id": task_id},
+        )
+        return
+
+    print(
+        f"  [classify] {pursuit_id[:8]} → channel={classification.channel} "
+        f"(conf={classification.confidence:.2f}) "
+        f"to={classification.contact_email or '-'} "
+        f"cc={len(classification.contact_cc)} "
+        f"lang={classification.language or 'en'} "
+        f"[{classification.reasoning[:80]}]"
+    )
+
+    ams_result = _post_pursuit_classification(
+        pursuit_id, classification=classification,
+    )
+
+    duration_ms = _elapsed_ms()
+    summary = (
+        f"channel={classification.channel} "
+        f"confidence={classification.confidence:.2f}"
+        + (f" to={classification.contact_email}" if classification.contact_email else "")
+    )
+    _audit(
+        "task_completed", summary,
+        node_name="classify_submission",
+        duration_ms=duration_ms,
+        output_payload={
+            "pursuit_id": pursuit_id,
+            "channel": classification.channel,
+            "confidence": classification.confidence,
+            "contact_email": classification.contact_email,
+            "contact_cc": classification.contact_cc,
+            "language": classification.language,
+            "ams_response": ams_result,
+        },
+    )
+    complete_agent_task(
+        client, task_id, status="completed",
+        result_summary=summary[:500], duration_ms=duration_ms,
+        metadata={
+            "pursuit_id": pursuit_id,
+            "channel": classification.channel,
+            "confidence": classification.confidence,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Email drafting — initial draft + revision passes
+# ---------------------------------------------------------------------------
+
+def _render_eml(
+    *,
+    to: str | None,
+    cc: list[str],
+    subject: str,
+    body: str,
+) -> str:
+    """Build a minimal RFC-5322 .eml so the operator can drag it into
+    Apple Mail / Outlook / Thunderbird and send.  We deliberately don't
+    set From — the operator's mail client fills that from their own
+    identity.  No MIME multipart in v1; plain text body only.
+    """
+
+    headers: list[str] = []
+    if to:
+        headers.append(f"To: {to}")
+    if cc:
+        headers.append(f"Cc: {', '.join(cc)}")
+    headers.append(f"Subject: {subject or '(no subject)'}")
+    headers.append("MIME-Version: 1.0")
+    headers.append('Content-Type: text/plain; charset="utf-8"')
+    return "\r\n".join(headers) + "\r\n\r\n" + (body or "")
+
+
+def _email_outputsummary(
+    *,
+    pursuit_id: str | None,
+    classification_channel: str | None,
+    draft: EmailDraftResult,
+    revision: int,
+) -> dict:
+    """Pack the EmailDraftResult into the Submission.outputSummary
+    shape the AMS EmailDraftEditor reads.  Mirrors the form_fill
+    output_summary contract so /approvals can render either type
+    with the same accordion structure.
+    """
+
+    fields_payload = [
+        {
+            "name": f.name[:200],
+            "value": (f.value or "")[:6000],
+            "confidence": round(f.confidence, 3),
+            "confidenceTier": f.confidence_tier,
+            "source": f.source,
+            "exampleDocIds": f.example_doc_ids,
+            "reasoning": (f.reasoning or "")[:400],
+            "filledBy": f"agent_rev{revision}",
+        }
+        for f in draft.fields
+    ]
+
+    suggested = [
+        {
+            "filenameHint": a.filename_hint[:200],
+            "description": a.description[:500],
+            "reason": a.reason[:500],
+        }
+        for a in draft.suggested_attachments
+    ]
+
+    return {
+        "channel": "email_submission",
+        "pursuit_id": pursuit_id,
+        "classification_channel": classification_channel,
+        "to": draft.to,
+        "cc": draft.cc,
+        "subject": draft.subject,
+        "body": draft.body,
+        "fields": fields_payload,
+        "suggestedAttachments": suggested,
+        "confidenceSummary": {
+            "high": draft.high_confidence_count,
+            "medium": draft.medium_confidence_count,
+            "low": draft.low_confidence_count,
+            "blank": draft.blank_count,
+        },
+        "examplesUsed": draft.examples_used,
+        "currentRevision": revision,
+    }
+
+
+def _fetch_pursuit_for_email(pursuit_id: str) -> dict:
+    """GET /api/tender-pursuits/{id} so we have the latest classification
+    fields + tender info before we draft.  Returns {} on any error —
+    caller treats that as "use whatever we have in task metadata".
+    """
+
+    try:
+        url = _ams_url(f"/api/tender-pursuits/{pursuit_id}")
+        resp = _httpx.get(
+            url, headers=_AUTH_HEADERS, timeout=10.0, follow_redirects=True,
+        )
+        if resp.status_code >= 400:
+            return {}
+        return resp.json() or {}
+    except Exception as exc:
+        print(f"  [draft-email] pursuit fetch failed: {exc}")
+        return {}
+
+
+def handle_draft_email_task(client: "NexusClient", task: dict) -> None:
+    """Process a draft_email_submission AgentTask.
+
+    Task metadata:
+        {
+          "type":         "draft_email_submission",
+          "pursuitId":    "<uuid>",
+          "tenderId":     "<uuid>",
+          "tenderTitle":  "...",
+          "tenderUrl":    "...",
+          "tenderAgency": "...",
+          "tenderDeadline": "<iso>",
+          "tenderDescription": "..."
+        }
+
+    Reads contact_email + cc + instructions + language from the pursuit
+    row (which the classifier populated earlier).  Drafts via Claude
+    Sonnet, generates an .eml so the operator can open in their mail
+    client, and submits via the existing approvals pipeline as
+    action_type='email_submission'.
+    """
+
+    start_time = time.perf_counter()
+    task_id = task.get("id")
+    metadata = task.get("metadata") or {}
+    pursuit_id = metadata.get("pursuitId")
+    tender_title = metadata.get("tenderTitle") or "(unknown tender)"
+    tender_url = metadata.get("tenderUrl") or ""
+    tender_agency = metadata.get("tenderAgency")
+    tender_deadline = metadata.get("tenderDeadline")
+    tender_description = metadata.get("tenderDescription") or ""
+
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - start_time) * 1000)
+
+    if not pursuit_id:
+        msg = "draft_email_submission task missing metadata.pursuitId"
+        print(f"  [draft-email] ERROR: {msg}")
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg, duration_ms=_elapsed_ms(),
+        )
+        return
+
+    print(
+        f"  [draft-email] Drafting email for pursuit {pursuit_id[:8]} "
+        f"— {tender_title[:80]}"
+    )
+
+    pursuit = _fetch_pursuit_for_email(pursuit_id)
+    contact_email = pursuit.get("submissionContactEmail")
+    contact_cc = pursuit.get("submissionContactCc") or []
+    instructions = pursuit.get("submissionInstructions")
+    language = pursuit.get("submissionLanguage")
+    classification_channel = pursuit.get("submissionChannel")
+
+    # Company KB context — same call form_fill uses, so the writer sees
+    # the same capability statements, certs, and past project notes.
+    company_context = fetch_agent_context()
+    if not company_context:
+        msg = (
+            "No company documents assigned to the tender-agent. "
+            "Upload context docs in Documents → assign to Tender Agent."
+        )
+        print(f"  [draft-email] {msg}")
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg, duration_ms=_elapsed_ms(),
+        )
+        mark_pursuit_status(
+            client, pursuit_id, "backlog",
+            notes=f"Auto-revert: {msg}",
+        )
+        return
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"email_draft_{pursuit_id[:8]}_")
+    try:
+        writer = EmailDraftWriter(llm_call_fn=call_llm)
+        draft = writer.draft(
+            tender_title=tender_title,
+            tender_description=tender_description,
+            tender_url=tender_url,
+            tender_agency=tender_agency,
+            tender_deadline=tender_deadline,
+            contact_email=contact_email,
+            contact_cc=contact_cc,
+            instructions=instructions,
+            language=language,
+            company_context=company_context,
+            example_emails="",  # v1: no separate email-example retrieval
+        )
+        print(
+            f"  [draft-email] Drafted: to={draft.to or '-'} "
+            f"cc={len(draft.cc)} subj='{draft.subject[:60]}' "
+            f"body_chars={len(draft.body)} "
+            f"high={draft.high_confidence_count} "
+            f"med={draft.medium_confidence_count} "
+            f"low={draft.low_confidence_count} "
+            f"cost=${draft.llm_cost_usd:.4f}"
+        )
+
+        # Build the .eml artefact + upload it as the submission document.
+        eml_text = _render_eml(
+            to=draft.to, cc=draft.cc, subject=draft.subject, body=draft.body,
+        )
+        safe_stem = "".join(
+            c if c.isalnum() or c in (" ", "_", "-") else "_"
+            for c in tender_title
+        )[:80].strip() or "tender_submission"
+        eml_filename = f"{safe_stem.replace(' ', '_')}_DRAFT.eml"
+        eml_path = os.path.join(tmp_dir, eml_filename)
+        with open(eml_path, "w", encoding="utf-8") as f:
+            f.write(eml_text)
+
+        output_summary = _email_outputsummary(
+            pursuit_id=pursuit_id,
+            classification_channel=classification_channel,
+            draft=draft,
+            revision=1,
+        )
+
+        duration_ms = _elapsed_ms()
+        result = client.submit_for_approval(
+            thread_id=None,
+            action_type="email_submission",
+            title=f"Email Draft: {tender_title[:300]}",
+            description=(
+                f"Drafted submission email for tender '{tender_title[:120]}'."
+                + (
+                    f" Recipient: {draft.to}."
+                    if draft.to else " Recipient could not be auto-extracted."
+                )
+                + f" {draft.blank_count} field(s) flagged blank/low-confidence — "
+                  "please review before approving."
+            ),
+            input_summary={
+                "pursuit_id": pursuit_id,
+                "task_id": task_id,
+                "tender_url": tender_url,
+                "contact_email_extracted": contact_email,
+            },
+            output_summary=output_summary,
+            file_path=eml_path,
+            filename=eml_filename,
+            metadata={
+                "duration_ms": duration_ms,
+                "cost_usd": draft.llm_cost_usd,
+                "llm_model": draft.llm_model or LLM_MODEL,
+                "pursuit_id": pursuit_id,
+                "channel": "email_submission",
+                "classificationChannel": classification_channel,
+                # Email submissions don't have a BLANK template the way
+                # form fills do — the .eml is THE artefact.  We still
+                # write a formats[] entry so the AMS download chip strip
+                # has a consistent shape with form submissions.
+                "formats": [],
+                "revisions": [
+                    {
+                        "rev": 1,
+                        "filledBy": "agent",
+                        "filledAt": datetime.now(timezone.utc).isoformat(),
+                        "summary": (
+                            f"Agent's initial draft: subject "
+                            f"({len(draft.subject)} chars), body "
+                            f"({len(draft.body)} chars), "
+                            f"to={'set' if draft.to else 'missing'}, "
+                            f"cc={len(draft.cc)}"
+                        ),
+                        "changedFieldNames": [
+                            f["name"] for f in output_summary.get("fields", [])
+                        ],
+                        "costUsd": float(draft.llm_cost_usd or 0),
+                    }
+                ],
+            },
+        )
+        submission_id = result.get("submissionId", "?")
+        print(f"  [draft-email] Approval submission created: {submission_id}")
+
+        notify_task_completed(
+            agent_name="tender-agent",
+            task_title=f"Email Drafted: {tender_title[:120]}",
+            summary=(
+                f"Drafted submission email for '{tender_title[:80]}'. "
+                f"Recipient {'set' if draft.to else 'NOT auto-extracted'}. "
+                "Awaiting human review."
+            ),
+            metrics={
+                "duration_ms": duration_ms,
+                "cost_usd": draft.llm_cost_usd,
+                "high": draft.high_confidence_count,
+                "medium": draft.medium_confidence_count,
+                "low": draft.low_confidence_count,
+            },
+            task_type="email_submission",
+        )
+
+        _audit(
+            "task_completed",
+            f"Email draft submitted: {eml_filename} → {submission_id}",
+            node_name="draft_email_submission",
+            duration_ms=duration_ms,
+            cost_usd=draft.llm_cost_usd,
+            output_payload={
+                "submission_id": submission_id,
+                "pursuit_id": pursuit_id,
+                "to": draft.to,
+                "cc_count": len(draft.cc),
+                "subject": draft.subject,
+                "body_chars": len(draft.body),
+                "suggested_attachment_count": len(draft.suggested_attachments),
+            },
+        )
+        complete_agent_task(
+            client, task_id, status="completed",
+            result_summary=f"Drafted email '{draft.subject[:80]}' (submission {submission_id[:8]})",
+            duration_ms=duration_ms,
+            metadata={
+                "submission_id": submission_id,
+                "pursuit_id": pursuit_id,
+                "to": draft.to,
+                "subject": draft.subject,
+            },
+        )
+        client.track(
+            "task_completion", 1.0,
+            metadata={"node": "draft_email_submission", "pursuit_id": pursuit_id},
+        )
+        client.track("latency", float(duration_ms),
+                     metadata={"node": "draft_email_submission"})
+        if draft.llm_cost_usd > 0:
+            client.track(
+                "cost", draft.llm_cost_usd,
+                metadata={"node": "draft_email_submission", "model": draft.llm_model or LLM_MODEL},
+            )
+
+    except Exception as exc:
+        traceback.print_exc()
+        msg = f"Email draft failed: {exc}"
+        print(f"  [draft-email] {msg}")
+        _audit(
+            "task_failed", msg, node_name="draft_email_submission",
+            status="failure", error_message=str(exc),
+            input_payload={"task_id": task_id, "pursuit_id": pursuit_id},
+        )
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg[:500], duration_ms=_elapsed_ms(),
+        )
+        notify_task_failed(
+            agent_name="tender-agent",
+            task_title=f"Email draft failed: {tender_title[:120]}",
+            error_message=str(exc)[:300],
+        )
+        client.track(
+            "error_rate", 1.0,
+            metadata={"node": "draft_email_submission", "error_type": type(exc).__name__},
+        )
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            client.flush()
+        except Exception as exc:
+            print(f"  [draft-email] Metric flush failed: {exc}")
+
+
+def handle_email_revision_task(
+    client: "NexusClient", task: dict, *, use_llm: bool,
+) -> None:
+    """Process a draft_email_regenerate or draft_email_revise task.
+
+    Mirrors handle_form_revision_task:
+      use_llm=False  — operator hit "Save my edits + regenerate".
+                       We splice their answers into the existing
+                       output_summary verbatim, rebuild the .eml,
+                       and PATCH the submission with rev+1.  No LLM.
+      use_llm=True   — operator hit "Send back to agent".  We re-run
+                       EmailDraftWriter.draft() with the operator's
+                       answers as anchors, then PATCH same way.
+
+    Task metadata:
+        {
+          "type":         "draft_email_regenerate" | "draft_email_revise",
+          "submissionId": "<uuid>",
+          "pursuitId":    "<uuid>",
+          "userAnswers":  {to?, cc?, subject?, body?},
+          "operatorNote": "..."  (optional, used as audit note)
+        }
+    """
+
+    start_time = time.perf_counter()
+    task_id = task.get("id")
+    metadata = task.get("metadata") or {}
+    submission_id = metadata.get("submissionId")
+    pursuit_id = metadata.get("pursuitId")
+    user_answers_raw = metadata.get("userAnswers") or {}
+    operator_note = metadata.get("operatorNote") or ""
+
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - start_time) * 1000)
+
+    if not submission_id:
+        msg = "email revision task missing metadata.submissionId"
+        print(f"  [email-revise] ERROR: {msg}")
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg, duration_ms=_elapsed_ms(),
+        )
+        return
+
+    # Coerce user answers into strings (frontend should already send
+    # strings, but be paranoid — Submission JSONB has no schema).
+    user_answers: dict[str, str] = {}
+    for k in ("to", "cc", "subject", "body"):
+        v = user_answers_raw.get(k)
+        if isinstance(v, str) and v.strip():
+            user_answers[k] = v
+        elif isinstance(v, list) and k == "cc":
+            user_answers[k] = ", ".join(str(x).strip() for x in v if str(x).strip())
+
+    # Pull the existing submission so we have its output_summary +
+    # tender context.
+    try:
+        full_url = _ams_url(f"/api/submissions/{submission_id}?full=1")
+        resp = _httpx.get(
+            full_url, headers=_AUTH_HEADERS, timeout=15.0, follow_redirects=True,
+        )
+        resp.raise_for_status()
+        existing = resp.json() or {}
+    except Exception as exc:
+        msg = f"Could not fetch existing submission: {exc}"
+        print(f"  [email-revise] {msg}")
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg[:500], duration_ms=_elapsed_ms(),
+        )
+        return
+
+    if existing.get("status") != "pending":
+        msg = (
+            f"Submission {submission_id[:8]} is {existing.get('status')} — "
+            "cannot revise."
+        )
+        print(f"  [email-revise] {msg}")
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg, duration_ms=_elapsed_ms(),
+        )
+        return
+
+    prev_out = existing.get("outputSummary") or {}
+    prev_meta = existing.get("metadata") or {}
+    prev_input = existing.get("inputSummary") or {}
+    revisions = prev_meta.get("revisions") if isinstance(prev_meta, dict) else None
+    prev_rev = (
+        max((int(r.get("rev", 0)) for r in revisions if isinstance(r, dict)), default=1)
+        if isinstance(revisions, list)
+        else 1
+    )
+    new_rev = prev_rev + 1
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"email_revise_{submission_id[:8]}_")
+    try:
+        if use_llm:
+            # Slow path: re-run the LLM with operator anchors.
+            print(f"  [email-revise] LLM re-draft (rev {new_rev}) for {submission_id[:8]}")
+            pursuit = _fetch_pursuit_for_email(pursuit_id) if pursuit_id else {}
+            tender_title = (
+                pursuit.get("tender", {}).get("title")
+                if isinstance(pursuit.get("tender"), dict) else None
+            ) or prev_input.get("tender_title") or existing.get("title") or "Tender"
+            tender_url = (
+                pursuit.get("tender", {}).get("url")
+                if isinstance(pursuit.get("tender"), dict) else None
+            ) or prev_input.get("tender_url") or ""
+            tender_agency = (
+                pursuit.get("tender", {}).get("agency")
+                if isinstance(pursuit.get("tender"), dict) else None
+            )
+            tender_deadline = (
+                pursuit.get("tender", {}).get("submissionDeadline")
+                if isinstance(pursuit.get("tender"), dict) else None
+            )
+            tender_description = (
+                pursuit.get("tender", {}).get("description")
+                if isinstance(pursuit.get("tender"), dict) else ""
+            ) or ""
+            contact_email = pursuit.get("submissionContactEmail") or prev_out.get("to")
+            contact_cc = pursuit.get("submissionContactCc") or prev_out.get("cc") or []
+            instructions = pursuit.get("submissionInstructions")
+            language = pursuit.get("submissionLanguage")
+
+            company_context = fetch_agent_context()
+            writer = EmailDraftWriter(llm_call_fn=call_llm)
+            draft = writer.draft(
+                tender_title=tender_title,
+                tender_description=tender_description,
+                tender_url=tender_url,
+                tender_agency=tender_agency,
+                tender_deadline=tender_deadline,
+                contact_email=contact_email,
+                contact_cc=contact_cc,
+                instructions=instructions,
+                language=language,
+                company_context=company_context,
+                example_emails="",
+                user_answers=user_answers,
+            )
+            new_output_summary = _email_outputsummary(
+                pursuit_id=pursuit_id,
+                classification_channel=pursuit.get("submissionChannel")
+                if isinstance(pursuit, dict) else None,
+                draft=draft,
+                revision=new_rev,
+            )
+            llm_cost = draft.llm_cost_usd
+        else:
+            # Fast path: merge operator answers verbatim, no LLM call.
+            print(
+                f"  [email-revise] Fast merge (rev {new_rev}) for "
+                f"{submission_id[:8]} — anchoring: {list(user_answers.keys())}"
+            )
+            existing_fields = (
+                prev_out.get("fields") if isinstance(prev_out, dict) else []
+            ) or []
+            merged_fields: list[dict] = []
+            for entry in existing_fields:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name", ""))
+                if name in user_answers:
+                    merged_fields.append({
+                        **entry,
+                        "value": user_answers[name],
+                        "confidence": 1.0,
+                        "confidenceTier": "high",
+                        "source": "user_input",
+                        "reasoning": (
+                            f"Operator edit in rev {new_rev}"
+                            + (f" — {operator_note[:120]}" if operator_note else "")
+                        ),
+                        "filledBy": f"human_rev{new_rev}",
+                    })
+                else:
+                    merged_fields.append(entry)
+
+            # Recompute the top-level to/cc/subject/body from the merged
+            # fields so the renderer sees the operator's values.
+            def _pick(name: str, default):
+                for f in merged_fields:
+                    if f.get("name") == name:
+                        return f.get("value", default)
+                return default
+
+            new_to = _pick("to", prev_out.get("to"))
+            new_cc_raw = _pick("cc", prev_out.get("cc") or [])
+            if isinstance(new_cc_raw, str):
+                new_cc = [
+                    s.strip()
+                    for s in re.split(r"[,;]+", new_cc_raw)
+                    if s.strip()
+                ]
+            else:
+                new_cc = list(new_cc_raw or [])
+            new_subject = _pick("subject", prev_out.get("subject") or "")
+            new_body = _pick("body", prev_out.get("body") or "")
+
+            # Recompute confidence summary tiers
+            high = sum(1 for f in merged_fields if f.get("confidenceTier") == "high")
+            medium = sum(1 for f in merged_fields if f.get("confidenceTier") == "medium")
+            low = sum(1 for f in merged_fields if f.get("confidenceTier") == "low")
+            blank = sum(1 for f in merged_fields if not str(f.get("value", "")).strip())
+
+            new_output_summary = {
+                **prev_out,
+                "to": new_to,
+                "cc": new_cc,
+                "subject": new_subject,
+                "body": new_body,
+                "fields": merged_fields,
+                "confidenceSummary": {
+                    "high": high, "medium": medium, "low": low, "blank": blank,
+                },
+                "currentRevision": new_rev,
+            }
+            # Build a synthetic EmailDraftResult only for the .eml writer +
+            # PATCH new_primary_document step.  We don't need the writer
+            # output here.
+            draft = EmailDraftResult(
+                to=new_to or None,
+                cc=new_cc,
+                subject=new_subject,
+                body=new_body,
+                suggested_attachments=[
+                    SuggestedAttachment(
+                        filename_hint=str(s.get("filenameHint", ""))[:200],
+                        description=str(s.get("description", ""))[:500],
+                        reason=str(s.get("reason", ""))[:500],
+                    )
+                    for s in (prev_out.get("suggestedAttachments") or [])
+                    if isinstance(s, dict)
+                ],
+                fields=[],   # not used downstream
+                high_confidence_count=high,
+                medium_confidence_count=medium,
+                low_confidence_count=low,
+                blank_count=blank,
+            )
+            llm_cost = 0.0
+
+        # Re-render the .eml + upload as the new primary document
+        eml_text = _render_eml(
+            to=draft.to, cc=draft.cc, subject=draft.subject, body=draft.body,
+        )
+        safe_stem = "".join(
+            c if c.isalnum() or c in (" ", "_", "-") else "_"
+            for c in (existing.get("title") or "tender_submission")
+        )[:80].strip() or "tender_submission"
+        eml_filename = f"{safe_stem.replace(' ', '_')}_DRAFT_rev{new_rev}.eml"
+        eml_path = os.path.join(tmp_dir, eml_filename)
+        with open(eml_path, "w", encoding="utf-8") as f:
+            f.write(eml_text)
+
+        up = client.upload_file(eml_path, filename=eml_filename)
+        new_primary = {
+            "minioKey": up.get("minioKey") or "",
+            "filename": up.get("filename") or eml_filename,
+            "mimeType": up.get("mimeType") or "message/rfc822",
+            "sizeBytes": int(up.get("sizeBytes") or os.path.getsize(eml_path)),
+        }
+
+        patch_body = {
+            "outputSummary": new_output_summary,
+            "metadata": {},  # nothing to merge from our side
+            "revision": {
+                "rev": new_rev,
+                "filledBy": "agent" if use_llm else "human",
+                "summary": (
+                    f"Agent re-drafted rev {new_rev} from operator anchors"
+                    if use_llm
+                    else f"Operator edits merged into rev {new_rev}"
+                ) + (f" — {operator_note[:120]}" if operator_note else ""),
+                "changedFieldNames": list(user_answers.keys()),
+                "costUsd": float(llm_cost or 0),
+            },
+            "newPrimaryDocument": new_primary,
+        }
+
+        url = _ams_url(f"/api/submissions/{submission_id}")
+        patch_resp = _httpx.patch(
+            url, json=patch_body, headers=_AUTH_HEADERS, timeout=20.0,
+        )
+        if patch_resp.status_code >= 400:
+            raise RuntimeError(
+                f"AMS PATCH /api/submissions/{submission_id[:8]} returned "
+                f"{patch_resp.status_code}: {patch_resp.text[:300]}"
+            )
+
+        duration_ms = _elapsed_ms()
+        summary = (
+            f"Email submission {submission_id[:8]} → rev {new_rev} "
+            f"({'LLM redraft' if use_llm else 'fast merge'})"
+        )
+        print(f"  [email-revise] {summary}")
+        _audit(
+            "task_completed", summary,
+            node_name="draft_email_revise" if use_llm else "draft_email_regenerate",
+            duration_ms=duration_ms,
+            cost_usd=llm_cost,
+            output_payload={
+                "submission_id": submission_id,
+                "pursuit_id": pursuit_id,
+                "rev": new_rev,
+                "use_llm": use_llm,
+                "changed_fields": list(user_answers.keys()),
+            },
+        )
+        complete_agent_task(
+            client, task_id, status="completed",
+            result_summary=summary[:500], duration_ms=duration_ms,
+            metadata={
+                "submission_id": submission_id,
+                "pursuit_id": pursuit_id,
+                "rev": new_rev,
+                "use_llm": use_llm,
+            },
+        )
+
+    except Exception as exc:
+        traceback.print_exc()
+        msg = f"Email revision failed: {exc}"
+        print(f"  [email-revise] {msg}")
+        _audit(
+            "task_failed", msg,
+            node_name="draft_email_revise" if use_llm else "draft_email_regenerate",
+            status="failure", error_message=str(exc),
+            input_payload={"task_id": task_id, "submission_id": submission_id},
+        )
+        complete_agent_task(
+            client, task_id, status="failed",
+            result_summary=msg[:500], duration_ms=_elapsed_ms(),
+        )
+        client.track(
+            "error_rate", 1.0,
+            metadata={
+                "node": "draft_email_revise" if use_llm else "draft_email_regenerate",
+                "error_type": type(exc).__name__,
+            },
+        )
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _broaden_filters(filters: dict) -> dict:
     """Relax constraints when the strict pass returned too few results.
 
@@ -3351,6 +4310,34 @@ def main() -> None:
                         # manual upload step.
                         mark_agent_task_running(client, task.get("id"))
                         handle_fetch_attachments_task(client, task)
+                    elif task_type == "classify_submission":
+                        # Session 8 — submission-channel classification.
+                        # Runs in parallel with fetch_pursuit_attachments
+                        # and decides form / email / portal / hybrid /
+                        # unknown.  Always cheap (no LLM), so we never
+                        # gate the operator on it.
+                        mark_agent_task_running(client, task.get("id"))
+                        handle_classify_submission_task(client, task)
+                    elif task_type == "draft_email_submission":
+                        # Session 8 — operator-triggered email draft for
+                        # tenders that wanted an emailed proposal rather
+                        # than an uploaded form.  Produces an .eml +
+                        # action_type='email_submission' Submission row
+                        # which lands in the Pursuits side panel for
+                        # HITL review (identical lifecycle to form_fill).
+                        mark_agent_task_running(client, task.get("id"))
+                        handle_draft_email_task(client, task)
+                    elif task_type in ("draft_email_regenerate", "draft_email_revise"):
+                        # Session 8 — HITL revision cycle for email
+                        # drafts.  Same shape as fill_form_regenerate /
+                        # fill_form_revise but operating on the email
+                        # fields (to/cc/subject/body) instead of form
+                        # fields.
+                        mark_agent_task_running(client, task.get("id"))
+                        handle_email_revision_task(
+                            client, task,
+                            use_llm=(task_type == "draft_email_revise"),
+                        )
                     else:
                         print(f"  [agent-tasks] Skipping unknown task type: {task_type}")
             except Exception as exc:

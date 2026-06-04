@@ -122,6 +122,24 @@ OPENROUTER_BASE_URL = os.getenv("QWEN_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = "anthropic/claude-sonnet-4"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
+# --- Sentry error monitoring -------------------------------------------------
+# No-op when SENTRY_DSN is unset or the sdk isn't installed, so the bridge runs
+# exactly as before without it. When configured it captures unhandled crashes
+# automatically, plus the caught poll-loop errors below (which only print today).
+try:
+    import sentry_sdk as _sentry
+except ImportError:  # sdk not installed in this environment
+    _sentry = None
+
+if _sentry and os.getenv("SENTRY_DSN"):
+    _sentry.init(
+        dsn=os.getenv("SENTRY_DSN"),
+        environment=os.getenv("SENTRY_ENVIRONMENT", "development"),
+        traces_sample_rate=0.0,      # errors only — conserve free-tier quota
+        send_default_pii=False,
+    )
+    print("[sentry] error monitoring enabled")
+
 # Module-level reference to the NexusClient (set in main())
 _client: "NexusClient | None" = None
 
@@ -4274,6 +4292,8 @@ def main() -> None:
             except Exception as exc:
                 print(f"  [search-jobs loop] {exc}")
                 traceback.print_exc()
+                if _sentry:
+                    _sentry.capture_exception(exc)
 
             try:
                 tasks = poll_agent_tasks()
@@ -4343,6 +4363,8 @@ def main() -> None:
             except Exception as exc:
                 print(f"  [agent-tasks loop] {exc}")
                 traceback.print_exc()
+                if _sentry:
+                    _sentry.capture_exception(exc)
 
             # Form-example ingestion (slow tick — 60s)
             now = time.time()

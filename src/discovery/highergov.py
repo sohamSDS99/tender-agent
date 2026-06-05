@@ -145,33 +145,61 @@ class HigherGovSearcher:
             logger.warning("highergov_skipped_no_key")
             return []
 
-        # `posted_date` accepts a single ISO date and returns everything posted
-        # ON that day. Searching back `days_back` days = walking dates back.
-        # We don't actually loop dates here — for the first cut we anchor to
-        # "yesterday" (the freshest fully-published day) and rely on the
-        # downstream deadline filter to keep only future-due tenders. If the
-        # operator needs deeper history we'll add a date-walk in a follow-up.
-        anchor_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        # HigherGov's `posted_date` filter accepts a single ISO date and
+        # returns everything posted ON that day — no range syntax. To cover
+        # `days_back`, we walk dates from yesterday backwards. Three guards
+        # keep quota usage bounded:
+        #   - Hard cap of MAX_DATES_TO_WALK days per call (~14 days max).
+        #     `days_back` is informational beyond that.
+        #   - Early exit once we've collected max_results * EARLY_EXIT_FACTOR
+        #     leads (downstream filters drop ~70% — overshoot a bit to stay
+        #     above max_results post-filter).
+        #   - Per-date budget = NAICS_CODES (6 calls/date × ≤100 records each).
+        # At default settings: 14 days × 6 NAICS × 100 records = 8400 records
+        # scanned per search worst-case, well under the 10K/month quota for
+        # human-paced discovery.
+        MAX_DATES_TO_WALK = 14
+        EARLY_EXIT_FACTOR = 3
+        effective_days = min(max(days_back, 1), MAX_DATES_TO_WALK)
+        target_collected = max_results * EARLY_EXIT_FACTOR
+
+        # Build the list of dates to query: yesterday, day-before, ...
+        today_utc = datetime.now(timezone.utc)
+        dates_to_query = [
+            (today_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(1, effective_days + 1)
+        ]
 
         collected: list[TenderLead] = []
         seen_keys: set[str] = set()
 
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
-                for naics in NAICS_CODES:
-                    page_results = self._fetch_naics_page(
-                        client, naics=naics, posted_date=anchor_date
-                    )
-                    for record in page_results:
-                        opp_key = record.get("opp_key", "")
-                        if opp_key and opp_key in seen_keys:
-                            continue
-                        if opp_key:
-                            seen_keys.add(opp_key)
-                        lead = self._record_to_lead(record)
-                        if lead is None:
-                            continue
-                        collected.append(lead)
+                for anchor_date in dates_to_query:
+                    for naics in NAICS_CODES:
+                        page_results = self._fetch_naics_page(
+                            client, naics=naics, posted_date=anchor_date
+                        )
+                        for record in page_results:
+                            opp_key = record.get("opp_key", "")
+                            if opp_key and opp_key in seen_keys:
+                                continue
+                            if opp_key:
+                                seen_keys.add(opp_key)
+                            lead = self._record_to_lead(record)
+                            if lead is None:
+                                continue
+                            collected.append(lead)
+                    # Early-exit between date hops — if we already have far
+                    # more than max_results candidates, the marginal cost of
+                    # another date isn't worth the quota.
+                    if len(collected) >= target_collected:
+                        logger.info(
+                            "highergov_early_exit",
+                            collected=len(collected),
+                            dates_used=dates_to_query.index(anchor_date) + 1,
+                        )
+                        break
         except httpx.HTTPError as exc:
             logger.warning("highergov_http_error", error=str(exc))
             return collected  # return partial — fan-out is resilient
@@ -182,7 +210,7 @@ class HigherGovSearcher:
 
         logger.info(
             "highergov_search_complete",
-            anchor_date=anchor_date,
+            dates_walked=len(dates_to_query),
             scanned=len(collected),
             returned=len(result),
             top_score=result[0].relevance_score if result else 0.0,

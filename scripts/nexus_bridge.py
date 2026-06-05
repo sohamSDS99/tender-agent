@@ -893,6 +893,16 @@ _PORTAL_TO_SOURCE: dict[str, str] = {
     "uganda_gpp":     "uganda_gpp",
     "mexico_cdmx":    "mexico_cdmx",
     "google_serp":    "serp_fallback",
+    # Session-7 OCDS additions
+    "uk_fts":             "uk_fts",
+    "norway_doffin":      "norway_doffin",
+    "ireland_etenders":   "ireland_etenders",
+    "switzerland_simap":  "switzerland_simap",
+    "singapore_gebiz":    "singapore_gebiz",
+    "nz_gets":            "nz_gets",
+    "eu_funding_tenders": "eu_funding_tenders",
+    # Session-12 — HigherGov paid aggregator
+    "highergov":          "highergov",
 }
 
 # Portal → canonical region (used to set DiscoveredTender.region when the
@@ -919,6 +929,16 @@ _PORTAL_TO_REGION: dict[str, str] = {
     "uganda_gpp":     "africa",
     "mexico_cdmx":    "south_america",
     "google_serp":    None,
+    # Session-7 OCDS additions
+    "uk_fts":             "uk",
+    "norway_doffin":      "europe",
+    "ireland_etenders":   "europe",
+    "switzerland_simap":  "europe",
+    "singapore_gebiz":    "singapore",
+    "nz_gets":            "pacific",
+    "eu_funding_tenders": "europe",
+    # Session-12 — HigherGov is US-only (federal + DLA + SLED)
+    "highergov":          "usa",
 }
 
 # Absolute floor — wins even when the user-supplied minRelevance is lower.

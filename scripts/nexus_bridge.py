@@ -1421,7 +1421,14 @@ def run_tender_search(filters: dict) -> dict:
         if url:
             seen_urls.add(url)
         if not hasattr(lead, "_effective_score"):
-            lead._effective_score = getattr(lead, "relevance_score", 0.80)
+            # Default to 0.0 — NOT 0.80. The old default was a quiet
+            # foot-gun: a Lead arriving without `relevance_score` would
+            # sneak past the 30% absolute floor and surface as a
+            # high-confidence match even though we had no signal at all.
+            # Today every searcher sets `relevance_score`, so this branch
+            # is dead code in practice; the safer default protects us
+            # against a future module forgetting.
+            lead._effective_score = getattr(lead, "relevance_score", 0.0)
         valid_leads.append(lead)
     print(f"  API after deadline filter + dedup: {len(valid_leads)} verified leads")
 

@@ -470,7 +470,7 @@ class NexusClient:
 
     def submit_for_approval(
         self,
-        thread_id: str,
+        thread_id: Optional[str],
         action_type: str,
         title: str,
         description: Optional[str] = None,
@@ -505,10 +505,16 @@ class NexusClient:
 
         payload: dict[str, Any] = {
             "agentName": self.agent_name,
-            "conversationId": thread_id,
             "actionType": action_type,
             "title": title,
         }
+        # Only include conversationId when truthy. AMS's /api/submissions/create
+        # Zod schema accepts a nullable UUID, but sending JSON `null` was
+        # making round-trip diagnostics noisier than needed. The other
+        # optional fields (description / inputSummary / metadata) already
+        # follow this pattern just below.
+        if thread_id:
+            payload["conversationId"] = thread_id
         if description:
             payload["description"] = description
         if input_summary:

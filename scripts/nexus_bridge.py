@@ -4204,7 +4204,10 @@ def main() -> None:
     print("")
 
     global _client
-    client = NexusClient(base_url=NEXUS_URL)
+    # Pass the agent API key so the SDK's _build_headers() sets
+    # `Authorization: Bearer <key>` on every tRPC + REST call. When the key
+    # is unset (dev), the SDK behaves as before (no auth header sent).
+    client = NexusClient(base_url=NEXUS_URL, api_key=_agent_api_key or None)
     _client = client
 
     config = AgentConfig(

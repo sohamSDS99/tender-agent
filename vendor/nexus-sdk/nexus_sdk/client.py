@@ -565,8 +565,11 @@ class NexusClient:
             The dest_path for convenience.
         """
         url = f"{self.base_url}/api/chat/files/{minio_key}"
+        # Use self._client so the auth headers from _build_headers() apply.
+        # Module-level `httpx.stream(...)` would bypass NEXUS_AGENT_API_KEY and
+        # 401 the moment AMS turns on agent auth.
         try:
-            with httpx.stream("GET", url, timeout=60.0, follow_redirects=True) as resp:
+            with self._client.stream("GET", url, follow_redirects=True) as resp:
                 resp.raise_for_status()
                 with open(dest_path, "wb") as f:
                     for chunk in resp.iter_bytes(chunk_size=8192):
@@ -597,10 +600,15 @@ class NexusClient:
 
         url = f"{self.base_url}/api/chat/agent-upload"
 
+        # Use self._client.post so the auth header carries through. Note
+        # we explicitly avoid passing `json=...` so httpx uses multipart
+        # (Content-Type is set automatically per `files`). The default
+        # JSON Content-Type from _build_headers() is overridden by httpx
+        # when `files=` is set.
         with open(file_path, "rb") as f:
             files = {"file": (display_name, f, mime_type)}
             data = {"agentName": self.agent_name or "unknown-agent"}
-            resp = httpx.post(url, files=files, data=data, timeout=60.0)
+            resp = self._client.post(url, files=files, data=data, timeout=60.0)
             resp.raise_for_status()
 
         result = resp.json()

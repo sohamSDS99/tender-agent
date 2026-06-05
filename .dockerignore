@@ -1,0 +1,50 @@
+# =============================================================================
+# .dockerignore — keep secrets and noise out of the bridge image
+# =============================================================================
+# `tender-agent/Dockerfile` does `COPY . .` after installing deps. Without
+# this file, the local .env (OpenRouter key, Supabase password, Voyage key,
+# Slack token, HigherGov key, Sentry DSN, …) gets baked into the image and
+# leaks to anyone who can pull a Railway layer hash.
+
+# --- Secrets ---
+.env
+.env.*
+.envrc
+
+# --- Python build / runtime caches ---
+__pycache__
+**/__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# --- Virtualenvs (devs sometimes ship one accidentally) ---
+.venv
+venv
+ENV
+
+# --- Editor / OS noise ---
+.vscode
+.idea
+.DS_Store
+
+# --- Git ---
+.git
+.gitignore
+.github
+
+# --- Local logs / scratch / test artifacts ---
+*.log
+.coverage
+htmlcov
+data
+output
+tmp
+
+# --- Docs that the running container doesn't need ---
+*.md
+!README.md

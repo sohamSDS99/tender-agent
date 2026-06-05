@@ -76,6 +76,7 @@ from src.discovery.switzerland_simap import SwitzerlandSimapSearcher
 from src.discovery.singapore_gebiz import SingaporeGebizSearcher
 from src.discovery.nz_gets import NzGetsSearcher
 from src.discovery.eu_funding_tenders import EuFundingTendersSearcher
+from src.discovery.highergov import HigherGovSearcher
 
 # Import form processing modules
 from src.forms.form_parser import FormParser
@@ -1127,6 +1128,7 @@ def run_tender_search(filters: dict) -> dict:
     # all I/O bound.
     # ------------------------------------------------------------------
     sam_api_key = os.getenv("SAM_GOV_API_KEY", "")
+    highergov_api_key = os.getenv("HIGHERGOV_API_KEY", "")
 
     def _ted():
         return TedEuropaSearcher().search(user_query=search_query, max_results=15)
@@ -1184,6 +1186,8 @@ def run_tender_search(filters: dict) -> dict:
         return NzGetsSearcher().search(user_query=search_query, max_results=10, days_back=60)
     def _eu_ft():
         return EuFundingTendersSearcher().search(user_query=search_query, max_results=10, days_back=60)
+    def _highergov():
+        return HigherGovSearcher().search(user_query=search_query, max_results=15, days_back=60)
 
     # Sources whose upstream JSON endpoints have been retired or changed
     # without backward compat (verified May 2026). Skipping them avoids
@@ -1311,6 +1315,16 @@ def run_tender_search(filters: dict) -> dict:
         # of chemical-safety consulting + SDS work. Public SEDIA API,
         # no auth required.
         _add("eu_funding_tenders", _eu_ft)
+
+    # HigherGov — paid aggregator (subscriber-only API, 10K records/mo quota).
+    # Adds DLA + SLED + pre-RFP coverage on top of SAM.gov. Federal overlap
+    # with sam_gov is dedup-safe (different source_portal → distinct
+    # fingerprints; operator sees both surfaces if both APIs found the same
+    # opportunity).
+    if region_match("usa", "global") and src_on("highergov") and highergov_api_key:
+        _add("highergov", _highergov)
+    elif region_match("usa", "global") and src_on("highergov") and not highergov_api_key:
+        print("  [HigherGov] Skipped — HIGHERGOV_API_KEY not set")
 
     print(f"  Fanning out to {len(api_jobs)} live APIs in parallel "
           f"({len(KNOWN_BROKEN_APIS)} known-broken skipped)…")

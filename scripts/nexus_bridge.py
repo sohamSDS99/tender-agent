@@ -259,7 +259,14 @@ def fetch_agent_context() -> str:
 
     try:
         import httpx
-        resp = httpx.get(f"{NEXUS_URL}/api/agents/tender-agent/context", timeout=10.0)
+        # Pass _AUTH_HEADERS so the call works when NEXUS_AGENT_API_KEY is
+        # set on the AMS side. With the key unset (dev), _AUTH_HEADERS is {}
+        # and behavior is unchanged.
+        resp = httpx.get(
+            f"{NEXUS_URL}/api/agents/tender-agent/context",
+            headers=_AUTH_HEADERS,
+            timeout=10.0,
+        )
         if resp.status_code != 200:
             print(f"Context endpoint returned {resp.status_code}")
             return ""
@@ -3424,22 +3431,18 @@ def handle_draft_email_task(client: "NexusClient", task: dict) -> None:
 
     # Company KB context — same call form_fill uses, so the writer sees
     # the same capability statements, certs, and past project notes.
+    # NOTE: previously this was a HARD prerequisite — if no docs were
+    # assigned, the task aborted. That was too strict: an email body can
+    # absolutely be drafted from the tender description alone (just with
+    # less specificity). Now we warn and pass empty context to the writer.
     company_context = fetch_agent_context()
     if not company_context:
-        msg = (
-            "No company documents assigned to the tender-agent. "
-            "Upload context docs in Documents → assign to Tender Agent."
+        print(
+            "  [draft-email] WARN: no company documents assigned to tender-agent — "
+            "drafting from tender description only. Upload + assign company KB docs "
+            "for richer drafts grounded in your capabilities."
         )
-        print(f"  [draft-email] {msg}")
-        complete_agent_task(
-            client, task_id, status="failed",
-            result_summary=msg, duration_ms=_elapsed_ms(),
-        )
-        mark_pursuit_status(
-            client, pursuit_id, "backlog",
-            notes=f"Auto-revert: {msg}",
-        )
-        return
+        company_context = ""
 
     tmp_dir = tempfile.mkdtemp(prefix=f"email_draft_{pursuit_id[:8]}_")
     try:

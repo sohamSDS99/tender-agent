@@ -524,11 +524,22 @@ class NexusClient:
         if metadata:
             payload["metadata"] = metadata
 
-        # Upload file if provided
+        # Upload file if provided. Best-effort: if MinIO is unreachable (or
+        # any other upload failure), log and continue WITHOUT a documentId.
+        # The submission still gets created with the full content in
+        # `outputSummary`; the operator can review + approve via the editor
+        # which reads from outputSummary, not from MinIO. Without this guard,
+        # one missing piece of infrastructure (object storage not provisioned
+        # yet) silently kills the entire draft-email flow.
         if file_path:
-            file_meta = self.upload_file(file_path, filename)
-            # Create a document record for this file
-            payload["documentId"] = file_meta.get("fileId")
+            try:
+                file_meta = self.upload_file(file_path, filename)
+                payload["documentId"] = file_meta.get("fileId")
+            except Exception as exc:
+                logger.warning(
+                    "submit_for_approval: file upload failed (continuing without document): %s",
+                    exc,
+                )
 
         result = self._api_post("/api/submissions/create", payload)
         logger.info(

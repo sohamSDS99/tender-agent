@@ -22,9 +22,17 @@ dependencies = [
     "alembic>=1.13.0,<2.0.0",
 
     # === Document Parsing ===
+    # `unstructured[pdf]` pulls pypdf/pdfminer.six as transitive deps today,
+    # but the bridge has direct top-level imports of pypdf / reportlab /
+    # openpyxl in form_writer.py + form_parser.py + nexus_bridge.py. Pinning
+    # them here means a future unstructured release that drops or relocates
+    # those won't silently break PDF/XLSX fill in production.
     "unstructured[pdf]>=0.16.0",
     "pdfplumber>=0.11.0,<1.0.0",
     "python-docx>=1.1.0,<2.0.0",
+    "pypdf>=4.0.0,<6.0.0",
+    "reportlab>=4.0.0,<5.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
 
     # === Slack ===
     "slack-bolt>=1.20.0,<2.0.0",

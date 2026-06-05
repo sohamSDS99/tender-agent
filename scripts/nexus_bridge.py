@@ -1329,22 +1329,55 @@ def run_tender_search(filters: dict) -> dict:
     print(f"  Fanning out to {len(api_jobs)} live APIs in parallel "
           f"({len(KNOWN_BROKEN_APIS)} known-broken skipped)…")
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    # Manual lifecycle (not `with`) so we can guarantee shutdown(wait=False,
+    # cancel_futures=True) on the timeout path. A `with` block would call
+    # shutdown(wait=True) on exit, which blocks indefinitely if any
+    # searcher is hung without an internal HTTP timeout — freezing the
+    # entire bridge poll loop on a single bad upstream.
+    pool = ThreadPoolExecutor(max_workers=10)
+    try:
         future_to_name = {pool.submit(fn): name for name, fn in api_jobs}
-        for future in as_completed(future_to_name, timeout=90):
-            name = future_to_name[future]
-            try:
-                leads = future.result() or []
-                api_leads.extend(leads)
-                print(f"  [{name}] Got {len(leads)} results")
-                _audit("tool_call", f"{name} returned {len(leads)} leads",
-                       node_name="discover", status="success",
-                       output_payload={"source": name, "count": len(leads)})
-            except Exception as exc:
-                print(f"  [{name}] Failed: {exc}")
-                _audit("tool_call", f"{name} failed: {exc}",
+        try:
+            for future in as_completed(future_to_name, timeout=90):
+                name = future_to_name[future]
+                try:
+                    leads = future.result() or []
+                    api_leads.extend(leads)
+                    print(f"  [{name}] Got {len(leads)} results")
+                    _audit("tool_call", f"{name} returned {len(leads)} leads",
+                           node_name="discover", status="success",
+                           output_payload={"source": name, "count": len(leads)})
+                except Exception as exc:
+                    print(f"  [{name}] Failed: {exc}")
+                    _audit("tool_call", f"{name} failed: {exc}",
+                           node_name="discover", status="failure",
+                           error_message=str(exc))
+                    # Per-source failures should surface in Sentry, otherwise
+                    # a quietly-broken module looks like "got 0 results" to
+                    # the operator forever.
+                    if _sentry:
+                        _sentry.capture_exception(exc)
+        except TimeoutError:
+            # Some futures didn't complete within 90s. Record them as
+            # failures (honest audit trail) then fall through to the
+            # finally block which cancels them.
+            pending = [(fut, n) for fut, n in future_to_name.items() if not fut.done()]
+            for _, src_name in pending:
+                print(f"  [{src_name}] Timed out after 90s (skipped)")
+                _audit("tool_call", f"{src_name} timed out after 90s",
                        node_name="discover", status="failure",
-                       error_message=str(exc))
+                       error_message="timeout_90s")
+            if _sentry and pending:
+                _sentry.capture_message(
+                    f"Fan-out timeout: {len(pending)} source(s) hung — "
+                    f"{', '.join(n for _, n in pending[:5])}",
+                    level="warning",
+                )
+    finally:
+        # wait=False + cancel_futures=True so a hung searcher (e.g. an
+        # httpx call without a per-client timeout) doesn't block bridge
+        # poll loop. cancel_futures requires Python 3.9+.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
     api_raw_count = len(api_leads)
@@ -1860,6 +1893,12 @@ def handle_fill_form_task(client: NexusClient, task: dict) -> None:
         client.track("error_rate", 1.0, metadata={
             "node": "fill_form", "error_type": type(exc).__name__,
         })
+    finally:
+        # Always clean up the temp directory we created at line ~1713.
+        # Without this, Railway's /tmp accumulates one mkdtemp per fill task
+        # and the container eventually OOMs on disk pressure. The other
+        # handlers (handle_form_revision_task etc.) already do this.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     try:
         client.flush()
@@ -4293,9 +4332,20 @@ def main() -> None:
     _LAST_FORM_EXAMPLE_TICK = [0.0]
     _FORM_EXAMPLE_INTERVAL_S = 60.0  # once a minute is plenty
 
+    # Track per-tick temp dirs so we can clean them up after the ingester
+    # finishes. Without this, the bridge leaks ~3 mkdtemps/minute (4,320/day)
+    # since process_pending_form_examples doesn't own its inputs' lifecycles.
+    _form_example_tmp_dirs: list[str] = []
+
     def _download_from_minio(_bucket: str, key: str) -> str:
-        """Download a MinIO object to a temp file and return the path."""
+        """Download a MinIO object to a temp file and return the path.
+
+        The temp dir is remembered in `_form_example_tmp_dirs`; the form-
+        example tick handler walks that list and rmtree's each one after the
+        ingester returns.
+        """
         tmp_dir = tempfile.mkdtemp(prefix="form_example_")
+        _form_example_tmp_dirs.append(tmp_dir)
         local_path = os.path.join(tmp_dir, os.path.basename(key) or "form_example.bin")
         client.download_file(key, local_path)
         return local_path
@@ -4421,6 +4471,12 @@ def main() -> None:
                 except Exception as exc:
                     print(f"  [form-examples loop] {exc}")
                     traceback.print_exc()
+                finally:
+                    # Clean up every temp dir _download_from_minio created
+                    # during this tick. Drains the list so the next tick
+                    # starts empty.
+                    while _form_example_tmp_dirs:
+                        shutil.rmtree(_form_example_tmp_dirs.pop(), ignore_errors=True)
 
             time.sleep(5.0)
 

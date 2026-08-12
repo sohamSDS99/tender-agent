@@ -76,10 +76,45 @@ from slack_notifier import (
 # ---------------------------------------------------------------------------
 
 NEXUS_URL = os.getenv("NEXUS_AMS_URL", "http://localhost:3000")
+
+# P0.0 — the bridge's credential for the AMS.
+#
+# Every bridge-facing endpoint on the AMS side currently falls open when this is
+# unset (`agent-auth.ts` begins `if (!required) return true;`). That fall-open is
+# being removed, at which point a call without this header gets a 401.
+#
+# This value must be IDENTICAL to NEXUS_AGENT_API_KEY on the AMS service. Set it
+# on both services before the AMS side ships its fail-closed change — see
+# docs/runbooks/credential-rotation.md in the nexus-ams repository.
+NEXUS_AGENT_API_KEY = os.getenv("NEXUS_AGENT_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("QWEN_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = "anthropic/claude-sonnet-4"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes")
+
+def _ams_headers() -> dict[str, str]:
+    """Auth headers for every direct call to the AMS.
+
+    P0.0. This module talks to the AMS two ways: through `NexusClient`, which has
+    always sent `Authorization` via its own `_build_headers()`, and through a
+    handful of raw `httpx` calls that did not. Those raw calls
+    (`/search`, `/context`, `/prompt`, and the dead `/inbox` poller) reached
+    bridge-facing endpoints with no credential at all, and only worked because
+    the AMS fell open when `NEXUS_AGENT_API_KEY` was unset.
+
+    Every raw AMS call must pass `headers=_ams_headers()`. There is no local
+    check enforcing that — the enforcement is the AMS itself, which returns 401
+    once its fall-open is removed. A forgotten header fails loudly and
+    immediately rather than silently granting access, which is the right
+    direction for this to fail.
+
+    Returns an empty dict when the key is unset, so local development against an
+    AMS that has not yet been hardened behaves exactly as before.
+    """
+    if not NEXUS_AGENT_API_KEY:
+        return {}
+    return {"Authorization": f"Bearer {NEXUS_AGENT_API_KEY}"}
+
 
 # Module-level reference to the NexusClient (set in main())
 _client: "NexusClient | None" = None
@@ -128,6 +163,7 @@ def search_knowledge_base(query: str, top_k: int = 15) -> str:
         resp = httpx.post(
             f"{NEXUS_URL}/api/agents/tender-agent/search",
             json={"query": query, "topK": top_k},
+            headers=_ams_headers(),
             timeout=15.0,
         )
         if resp.status_code != 200:
@@ -199,7 +235,11 @@ def fetch_agent_context() -> str:
 
     try:
         import httpx
-        resp = httpx.get(f"{NEXUS_URL}/api/agents/tender-agent/context", timeout=10.0)
+        resp = httpx.get(
+            f"{NEXUS_URL}/api/agents/tender-agent/context",
+            headers=_ams_headers(),
+            timeout=10.0,
+        )
         if resp.status_code != 200:
             print(f"Context endpoint returned {resp.status_code}")
             return ""
@@ -266,7 +306,15 @@ def _extract_text_locally(minio_key: str, filename: str) -> str:
 
         # Download from AMS file endpoint
         url = f"{NEXUS_URL}/api/chat/files/{minio_key}"
-        resp = httpx.get(url, timeout=30.0, follow_redirects=True)
+        # This endpoint is one of the seven with no auth at all today (P0.1
+        # closes it). Send the credential now so the bridge does not break the
+        # moment it is closed.
+        resp = httpx.get(
+            url,
+            headers=_ams_headers(),
+            timeout=30.0,
+            follow_redirects=True,
+        )
         if resp.status_code != 200:
             print(f"    Download failed: HTTP {resp.status_code}")
             return ""
@@ -375,6 +423,7 @@ def fetch_active_prompt() -> str:
         agent_name = "tender-agent"
         resp = httpx.get(
             f"{NEXUS_URL}/api/agents/{agent_name}/prompt",
+            headers=_ams_headers(),
             timeout=5.0,
         )
         if resp.status_code == 200:
@@ -2500,7 +2549,7 @@ def main() -> None:
                 # Poll the inbox endpoint for new messages
                 import httpx
                 inbox_url = f"{NEXUS_URL}/api/agents/tender-agent/inbox"
-                resp = httpx.get(inbox_url, timeout=10.0)
+                resp = httpx.get(inbox_url, headers=_ams_headers(), timeout=10.0)
 
                 if resp.status_code == 200:
                     data = resp.json()

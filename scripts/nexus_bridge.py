@@ -116,6 +116,39 @@ def _ams_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {NEXUS_AGENT_API_KEY}"}
 
 
+def _report_auth_failure(status_code: int, what: str) -> bool:
+    """Print an unmissable message when the AMS refuses a call for auth reasons.
+
+    Returns True when the status was an auth failure, so a caller can tell a
+    credential fault apart from an ordinary miss.
+
+    `_ams_headers()` above returns `{}` when the key is unset, and three of this
+    module's AMS calls degrade quietly rather than failing: a knowledge-base
+    search falls back to legacy context, a file download returns "", and a
+    prompt fetch falls back to the built-in prompt. Each then carries on. So a
+    missing or mismatched credential does not present as an outage — it presents
+    as the agent quietly getting worse at its job, which is far harder to notice
+    and much harder to attribute.
+
+    P0.1 closed the endpoints these calls use, so an unset or wrong key now
+    produces 401 here instead of a silent success.
+    """
+    if status_code not in (401, 403):
+        return False
+    print("")
+    print("  " + "!" * 68)
+    print(f"  !! AUTH FAILURE — AMS returned {status_code} for {what}.")
+    print("  !! This is a CONFIGURATION fault, not a data condition.")
+    print("  !! NEXUS_AGENT_API_KEY must be set to the SAME value on this")
+    print("  !! bridge and on the AMS web service.")
+    print("  !! The agent continues with degraded input; results will be worse")
+    print("  !! until this is fixed. See docs/runbooks/p0.1-bridge-auth.md in")
+    print("  !! the nexus-ams repository.")
+    print("  " + "!" * 68)
+    print("")
+    return True
+
+
 # Module-level reference to the NexusClient (set in main())
 _client: "NexusClient | None" = None
 
@@ -167,6 +200,7 @@ def search_knowledge_base(query: str, top_k: int = 15) -> str:
             timeout=15.0,
         )
         if resp.status_code != 200:
+            _report_auth_failure(resp.status_code, "knowledge-base search")
             print(f"KB search returned {resp.status_code}, falling back to legacy context")
             return fetch_agent_context()
 
@@ -316,6 +350,7 @@ def _extract_text_locally(minio_key: str, filename: str) -> str:
             follow_redirects=True,
         )
         if resp.status_code != 200:
+            _report_auth_failure(resp.status_code, f"file download ({minio_key})")
             print(f"    Download failed: HTTP {resp.status_code}")
             return ""
 
@@ -426,6 +461,7 @@ def fetch_active_prompt() -> str:
             headers=_ams_headers(),
             timeout=5.0,
         )
+        _report_auth_failure(resp.status_code, "active prompt fetch")
         if resp.status_code == 200:
             data = resp.json()
             if data.get("hasActivePrompt"):
@@ -2451,6 +2487,40 @@ def handle_message(client: NexusClient, message: dict) -> None:
 # Main — Registration + Heartbeat + Inbox Polling
 # ---------------------------------------------------------------------------
 
+def _require_agent_credential() -> None:
+    """Refuse to run without NEXUS_AGENT_API_KEY (MR2).
+
+    P0.0 made every raw AMS call send `_ams_headers()`, but that helper returns
+    `{}` when the key is unset — correct then, because the AMS fell open and the
+    bridge worked anyway, which is precisely how the key stayed unset in
+    production for months. P0.1 closed those endpoints. An unset key now means
+    every AMS call is refused while the agent appears to run normally.
+
+    A loud refusal to start is the right trade. It mirrors
+    `apps/web/src/instrumentation.ts` on the AMS side, which already refuses to
+    boot for the same reason: an outage is visible in thirty seconds, silent
+    degradation was not visible for months.
+    """
+    if NEXUS_AGENT_API_KEY:
+        return
+
+    print("")
+    print("*** STARTUP REFUSED — missing required configuration ***")
+    print("")
+    print("  NEXUS_AGENT_API_KEY is unset.")
+    print("")
+    print("  It authenticates every bridge -> AMS call and must be set to the")
+    print("  SAME value here and on the AMS web service. Without it the AMS")
+    print("  refuses every request (401) and this agent runs but accomplishes")
+    print("  nothing: knowledge-base search, file downloads and the active")
+    print("  prompt all fail, two of them silently.")
+    print("")
+    print("  Set it in this service's environment and restart. See")
+    print("  docs/runbooks/p0.1-bridge-auth.md in the nexus-ams repository.")
+    print("")
+    raise SystemExit(1)
+
+
 def main() -> None:
     print("")
     print("=" * 60)
@@ -2460,8 +2530,11 @@ def main() -> None:
     print(f"  LLM Model:   {LLM_MODEL}")
     print(f"  Dry Run:     {DRY_RUN}")
     print(f"  OpenRouter:  {'configured' if OPENROUTER_API_KEY else 'NOT configured'}")
+    print(f"  Agent token: {'set' if NEXUS_AGENT_API_KEY else 'UNSET — every AMS call will be refused'}")
     print("=" * 60)
     print("")
+
+    _require_agent_credential()
 
     # Step 1: Create client and register
     global _client
